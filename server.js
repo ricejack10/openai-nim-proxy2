@@ -25,27 +25,37 @@ const SHOW_REASONING = process.env.SHOW_REASONING !== 'false'; // default ON
 const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE !== 'false'; // default ON
 
 // Model mapping — maps OpenAI model names to NVIDIA NIM model IDs
-// Models marked with [THINKING] support the thinking parameter
 const MODEL_MAPPING = {
-  'gpt-3.5-turbo':   'nvidia/llama-3.1-nemotron-ultra-253b-v1', // [THINKING]
-  'gpt-4':           'qwen/qwen3-235b-a22b-instruct-2503',       // [THINKING]
-  'gpt-4-turbo':     'deepseek-ai/deepseek-r1',                  // [THINKING]
-  'gpt-4o':          'deepseek-ai/deepseek-v3',
-  'gpt-4o-mini':     'meta/llama-3.3-70b-instruct',
-  'claude-3-opus':   'nvidia/llama-3.1-nemotron-ultra-253b-v1', // [THINKING]
-  'claude-3-sonnet': 'qwen/qwen3-235b-a22b-instruct-2503',      // [THINKING]
-  'claude-3-haiku':  'meta/llama-3.3-70b-instruct',
-  'gemini-pro':      'deepseek-ai/deepseek-r1',                  // [THINKING]
+  'gpt-3.5-turbo':   'nvidia/llama-3.1-nemotron-ultra-253b-v1', // reasoning via system prompt
+  'gpt-4':           'qwen/qwen3-235b-a22b',                    // reasoning via chat_template_kwargs
+  'gpt-4-turbo':     'deepseek-ai/deepseek-r1-0528',            // always reasons natively
+  'gpt-4o':          'deepseek-ai/deepseek-v3',                 // no thinking
+  'gpt-4o-mini':     'meta/llama-3.3-70b-instruct',             // no thinking
+  'claude-3-opus':   'nvidia/llama-3.1-nemotron-ultra-253b-v1', // reasoning via system prompt
+  'claude-3-sonnet': 'qwen/qwen3-235b-a22b',                    // reasoning via chat_template_kwargs
+  'claude-3-haiku':  'deepseek-ai/deepseek-r1-distill-qwen-32b',// distilled R1, always reasons
+  'gemini-pro':      'deepseek-ai/deepseek-r1-0528',            // always reasons natively
 };
 
-// Models that support the chat_template_kwargs thinking parameter
-const THINKING_SUPPORTED_MODELS = new Set([
-  'nvidia/llama-3.1-nemotron-ultra-253b-v1',
-  'qwen/qwen3-235b-a22b-instruct-2503',
-  'qwen/qwen3-coder-480b-a35b-instruct',
-  'deepseek-ai/deepseek-r1',
+// DeepSeek R1 models reason natively — no extra parameter needed, they always output <think> blocks
+const NATIVE_REASONING_MODELS = new Set([
   'deepseek-ai/deepseek-r1-0528',
+  'deepseek-ai/deepseek-r1-distill-qwen-32b',
+  'deepseek-ai/deepseek-r1-distill-qwen-14b',
+  'deepseek-ai/deepseek-r1-distill-llama-8b',
 ]);
+
+// Qwen3 models use chat_template_kwargs: { enable_thinking: true }
+const QWEN3_THINKING_MODELS = new Set([
+  'qwen/qwen3-235b-a22b',
+  'qwen/qwen3-coder-480b-a35b-instruct',
+]);
+
+// Nemotron Ultra controls reasoning via a magic system prompt prefix
+const NEMOTRON_REASONING_MODELS = new Set([
+  'nvidia/llama-3.1-nemotron-ultra-253b-v1',
+]);
+const NEMOTRON_THINKING_SYSTEM_PROMPT = 'detailed thinking on';
 
 // Health check
 app.get('/health', (req, res) => {
@@ -82,19 +92,33 @@ app.post('/v1/chat/completions', async (req, res) => {
     // Resolve model
     let nimModel = MODEL_MAPPING[model] || model;
 
-    // Build NIM request body — chat_template_kwargs goes directly in the body, NOT in extra_body
+    // Clone messages so we don't mutate the original
+    let finalMessages = messages.map(m => ({ ...m }));
+
+    // Nemotron Ultra: inject reasoning system prompt if thinking mode is on
+    if (ENABLE_THINKING_MODE && NEMOTRON_REASONING_MODELS.has(nimModel)) {
+      const hasSystem = finalMessages.length > 0 && finalMessages[0].role === 'system';
+      if (hasSystem) {
+        finalMessages[0] = { ...finalMessages[0], content: NEMOTRON_THINKING_SYSTEM_PROMPT + '\n\n' + finalMessages[0].content };
+      } else {
+        finalMessages = [{ role: 'system', content: NEMOTRON_THINKING_SYSTEM_PROMPT }, ...finalMessages];
+      }
+    }
+
+    // Build NIM request body
     const nimRequestBody = {
       model: nimModel,
-      messages: messages,
+      messages: finalMessages,
       temperature: temperature ?? 0.6,
       max_tokens: max_tokens || 16384,
       stream: stream || false,
     };
 
-    // Only add thinking parameter for models that actually support it
-    if (ENABLE_THINKING_MODE && THINKING_SUPPORTED_MODELS.has(nimModel)) {
-      nimRequestBody.chat_template_kwargs = { thinking: true };
+    // Qwen3: uses chat_template_kwargs: { enable_thinking: true }
+    if (ENABLE_THINKING_MODE && QWEN3_THINKING_MODELS.has(nimModel)) {
+      nimRequestBody.chat_template_kwargs = { enable_thinking: true };
     }
+    // DeepSeek R1 distilled: always reasons natively, no parameter needed
 
     const response = await axios.post(
       `${NIM_API_BASE}/chat/completions`,
