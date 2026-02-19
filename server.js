@@ -25,24 +25,29 @@ const SHOW_REASONING = process.env.SHOW_REASONING !== 'false'; // default ON
 const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE !== 'false'; // default ON
 
 // Model mapping — maps OpenAI model names to NVIDIA NIM model IDs
+// CONFIRMED LIVE as of Feb 2026
 const MODEL_MAPPING = {
-  'gpt-3.5-turbo':   'nvidia/llama-3.1-nemotron-ultra-253b-v1', // reasoning via system prompt
-  'gpt-4':           'qwen/qwen3-235b-a22b',                    // reasoning via chat_template_kwargs
-  'gpt-4-turbo':     'deepseek-ai/deepseek-r1-0528',            // always reasons natively
-  'gpt-4o':          'deepseek-ai/deepseek-v3',                 // no thinking
-  'gpt-4o-mini':     'meta/llama-3.3-70b-instruct',             // no thinking
-  'claude-3-opus':   'nvidia/llama-3.1-nemotron-ultra-253b-v1', // reasoning via system prompt
-  'claude-3-sonnet': 'qwen/qwen3-235b-a22b',                    // reasoning via chat_template_kwargs
-  'claude-3-haiku':  'deepseek-ai/deepseek-r1-distill-qwen-32b',// distilled R1, always reasons
-  'gemini-pro':      'deepseek-ai/deepseek-r1-0528',            // always reasons natively
+  // ✅ THINKING CONFIRMED WORKING:
+  'gpt-4':           'qwen/qwen3-235b-a22b',                     // Qwen3 235B — best for creative/RP, thinking via parameter
+  'gpt-3.5-turbo':   'nvidia/llama-3.1-nemotron-ultra-253b-v1',  // Nemotron Ultra — NVIDIA's own, thinking via system prompt
+  'claude-3-opus':   'qwen/qwen3-235b-a22b',                     // alias for gpt-4
+  'claude-3-sonnet': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',  // alias for gpt-3.5-turbo
+
+  // ✅ NATIVE REASONING (always outputs <think> blocks, no parameter needed):
+  'gpt-4-turbo':     'deepseek-ai/deepseek-r1-distill-qwen-14b', // R1 distill 14B — fast, reliable, native reasoning
+  'claude-3-haiku':  'deepseek-ai/deepseek-r1-distill-llama-8b', // R1 distill 8B — fastest option, native reasoning
+  'gemini-pro':      'deepseek-ai/deepseek-r1-distill-qwen-14b', // alias for gpt-4-turbo
+
+  // ✅ FAST (no thinking, best for quick replies):
+  'gpt-4o':          'deepseek-ai/deepseek-v3.2',                // DeepSeek V3.2 — 685B, fast, no think blocks
+  'gpt-4o-mini':     'meta/llama-3.3-70b-instruct',              // LLaMA 70B — lightest fallback
 };
 
-// DeepSeek R1 models reason natively — no extra parameter needed, they always output <think> blocks
+// R1 distilled models reason natively — always output <think> blocks, no parameter needed
 const NATIVE_REASONING_MODELS = new Set([
-  'deepseek-ai/deepseek-r1-0528',
-  'deepseek-ai/deepseek-r1-distill-qwen-32b',
   'deepseek-ai/deepseek-r1-distill-qwen-14b',
   'deepseek-ai/deepseek-r1-distill-llama-8b',
+  'deepseek-ai/deepseek-r1-distill-qwen-32b', // kept in case you want to try it manually
 ]);
 
 // Qwen3 models use chat_template_kwargs: { enable_thinking: true }
@@ -51,7 +56,7 @@ const QWEN3_THINKING_MODELS = new Set([
   'qwen/qwen3-coder-480b-a35b-instruct',
 ]);
 
-// Nemotron Ultra controls reasoning via a magic system prompt prefix
+// Nemotron Ultra triggers reasoning via a system prompt prefix
 const NEMOTRON_REASONING_MODELS = new Set([
   'nvidia/llama-3.1-nemotron-ultra-253b-v1',
 ]);
