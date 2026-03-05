@@ -1,4 +1,4 @@
-// server.js - OpenAI to NVIDIA NIM API Proxy (Fixed & Improved)
+// server.js - OpenAI to NVIDIA NIM API Proxy
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -6,75 +6,51 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// NVIDIA NIM API configuration
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
-const NIM_API_KEY = process.env.NIM_API_KEY;
+const NIM_API_KEY  = process.env.NIM_API_KEY;
 
-// 🔥 REASONING DISPLAY TOGGLE
-// When true, <think>...</think> reasoning blocks are injected into the content
-// so clients like JanitorAI can see the model's thought process
-const SHOW_REASONING = process.env.SHOW_REASONING !== 'false'; // default ON
-
-// 🔥 THINKING MODE TOGGLE
-// When true, passes chat_template_kwargs: { thinking: true } to models that support it.
-// Only enable for models that actually support extended thinking (e.g. Qwen3, DeepSeek-R1)
-const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE !== 'false'; // default ON
-
-// Model mapping — maps OpenAI model names to NVIDIA NIM model IDs
-// CONFIRMED LIVE as of Feb 2026
+// Model mapping — OpenAI names → NVIDIA NIM model IDs
 const MODEL_MAPPING = {
-  // ✅ THINKING CONFIRMED WORKING:
-  'gpt-4':           'qwen/qwen3-235b-a22b',                     // Qwen3 235B — best for creative/RP, thinking via parameter
-  'gpt-3.5-turbo':   'nvidia/llama-3.1-nemotron-ultra-253b-v1',  // Nemotron Ultra — NVIDIA's own, thinking via system prompt
-  'claude-3-opus':   'qwen/qwen3-235b-a22b',                     // alias for gpt-4
-  'claude-3-sonnet': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',  // alias for gpt-3.5-turbo
-
-  // ✅ NATIVE REASONING (always outputs <think> blocks, no parameter needed):
-  'gpt-4-turbo':     'deepseek-ai/deepseek-r1-distill-qwen-14b', // R1 distill 14B — fast, reliable, native reasoning
-  'claude-3-haiku':  'deepseek-ai/deepseek-r1-distill-llama-8b', // R1 distill 8B — fastest option, native reasoning
-  'gemini-pro':      'deepseek-ai/deepseek-r1-distill-qwen-14b', // alias for gpt-4-turbo
-
-  // ✅ FAST (no thinking, best for quick replies):
-  'gpt-4o':          'deepseek-ai/deepseek-v3.2',                // DeepSeek V3.2 — 685B, fast, no think blocks
-  'gpt-4o-mini':     'meta/llama-3.3-70b-instruct',              // LLaMA 70B — lightest fallback
+  'gpt-4':           'qwen/qwen3-235b-a22b',
+  'gpt-3.5-turbo':   'nvidia/llama-3.1-nemotron-ultra-253b-v1',
+  'claude-3-opus':   'qwen/qwen3-235b-a22b',
+  'claude-3-sonnet': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
+  'gpt-4-turbo':     'deepseek-ai/deepseek-r1-distill-qwen-14b',
+  'claude-3-haiku':  'deepseek-ai/deepseek-r1-distill-llama-8b',
+  'gemini-pro':      'deepseek-ai/deepseek-r1-distill-qwen-14b',
+  'gpt-4o':          'deepseek-ai/deepseek-v3.2',
+  'gpt-4o-mini':     'meta/llama-3.3-70b-instruct',
 };
 
-// R1 distilled models reason natively — always output <think> blocks, no parameter needed
-const NATIVE_REASONING_MODELS = new Set([
+// These models always output <think> blocks natively — strip them silently
+const NATIVE_THINKERS = new Set([
   'deepseek-ai/deepseek-r1-distill-qwen-14b',
   'deepseek-ai/deepseek-r1-distill-llama-8b',
-  'deepseek-ai/deepseek-r1-distill-qwen-32b', // kept in case you want to try it manually
+  'deepseek-ai/deepseek-r1-distill-qwen-32b',
 ]);
 
-// Qwen3 models use chat_template_kwargs: { enable_thinking: true }
-const QWEN3_THINKING_MODELS = new Set([
-  'qwen/qwen3-235b-a22b',
-  'qwen/qwen3-coder-480b-a35b-instruct',
-]);
-
-// Nemotron Ultra triggers reasoning via a system prompt prefix
-const NEMOTRON_REASONING_MODELS = new Set([
-  'nvidia/llama-3.1-nemotron-ultra-253b-v1',
-]);
-const NEMOTRON_THINKING_SYSTEM_PROMPT = 'detailed thinking on';
+// Strip <think>...</think> blocks from a completed string
+function stripThinking(text) {
+  text = text.replace(/<think>[\s\S]*?<\/think>/gi, '');
+  text = text.replace(/<think>[\s\S]*/gi, '');
+  return text.trimStart();
+}
 
 // Health check
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     service: 'OpenAI → NVIDIA NIM Proxy',
-    reasoning_display: SHOW_REASONING,
-    thinking_mode: ENABLE_THINKING_MODE,
+    thinking: 'disabled',
     nim_base: NIM_API_BASE,
     api_key_set: !!NIM_API_KEY,
   });
 });
 
-// List models (OpenAI compatible)
+// List models
 app.get('/v1/models', (req, res) => {
   const models = Object.keys(MODEL_MAPPING).map(id => ({
     id,
@@ -85,45 +61,36 @@ app.get('/v1/models', (req, res) => {
   res.json({ object: 'list', data: models });
 });
 
-// ─── Main proxy endpoint ────────────────────────────────────────────────────
+// Main proxy
 app.post('/v1/chat/completions', async (req, res) => {
   if (!NIM_API_KEY) {
-    return res.status(500).json({ error: { message: 'NIM_API_KEY environment variable not set', type: 'server_error' } });
+    return res.status(500).json({ error: { message: 'NIM_API_KEY not set', type: 'server_error' } });
   }
 
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
+    const nimModel = MODEL_MAPPING[model] || model;
+    const isNativeThinker = NATIVE_THINKERS.has(nimModel);
 
-    // Resolve model
-    let nimModel = MODEL_MAPPING[model] || model;
+    const ts = () => new Date().toISOString();
+    console.log(`\n${'─'.repeat(60)}`);
+    console.log(`[${ts()}] REQUEST — ${model} → ${nimModel}`);
+    console.log(`Stream: ${stream || false} | Max tokens: ${max_tokens || 16384}`);
+    console.log(`Messages (${messages.length}):`);
+    messages.forEach((msg, i) => {
+      const preview = typeof msg.content === 'string'
+        ? msg.content.slice(0, 300) + (msg.content.length > 300 ? '…' : '')
+        : '[non-text content]';
+      console.log(`  [${i}] ${msg.role.toUpperCase()}: ${preview}`);
+    });
 
-    // Clone messages so we don't mutate the original
-    let finalMessages = messages.map(m => ({ ...m }));
-
-    // Nemotron Ultra: inject reasoning system prompt if thinking mode is on
-    if (ENABLE_THINKING_MODE && NEMOTRON_REASONING_MODELS.has(nimModel)) {
-      const hasSystem = finalMessages.length > 0 && finalMessages[0].role === 'system';
-      if (hasSystem) {
-        finalMessages[0] = { ...finalMessages[0], content: NEMOTRON_THINKING_SYSTEM_PROMPT + '\n\n' + finalMessages[0].content };
-      } else {
-        finalMessages = [{ role: 'system', content: NEMOTRON_THINKING_SYSTEM_PROMPT }, ...finalMessages];
-      }
-    }
-
-    // Build NIM request body
     const nimRequestBody = {
       model: nimModel,
-      messages: finalMessages,
+      messages,
       temperature: temperature ?? 0.6,
       max_tokens: max_tokens || 16384,
       stream: stream || false,
     };
-
-    // Qwen3: uses chat_template_kwargs: { enable_thinking: true }
-    if (ENABLE_THINKING_MODE && QWEN3_THINKING_MODELS.has(nimModel)) {
-      nimRequestBody.chat_template_kwargs = { enable_thinking: true };
-    }
-    // DeepSeek R1 distilled: always reasons natively, no parameter needed
 
     const response = await axios.post(
       `${NIM_API_BASE}/chat/completions`,
@@ -139,15 +106,18 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
     );
 
-    // ── Streaming ──────────────────────────────────────────────────────────
+    // ── Streaming ────────────────────────────────────────────────────────────
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       res.setHeader('X-Accel-Buffering', 'no');
 
+      console.log(`[${ts()}] RESPONSE (streaming)…`);
+      let streamedContent = '';
       let buffer = '';
-      let thinkOpen = false; // tracks whether we've opened a <think> tag
+      let thinkBuffer = '';
+      let inThink = false;
 
       response.data.on('data', (chunk) => {
         buffer += chunk.toString();
@@ -159,12 +129,6 @@ app.post('/v1/chat/completions', async (req, res) => {
           if (!trimmed) continue;
 
           if (trimmed === 'data: [DONE]') {
-            // If reasoning was streaming and never got a closing tag, close it now
-            if (thinkOpen && SHOW_REASONING) {
-              const closingChunk = buildDeltaChunk(model, '</think>\n\n');
-              res.write(`data: ${JSON.stringify(closingChunk)}\n\n`);
-              thinkOpen = false;
-            }
             res.write('data: [DONE]\n\n');
             continue;
           }
@@ -179,79 +143,85 @@ app.post('/v1/chat/completions', async (req, res) => {
             const delta = data.choices?.[0]?.delta;
             if (!delta) { res.write(`data: ${JSON.stringify(data)}\n\n`); continue; }
 
-            const reasoningChunk = delta.reasoning_content ?? null;
-            const contentChunk  = delta.content ?? null;
-
-            // Remove reasoning_content from delta — we handle it ourselves
             delete delta.reasoning_content;
 
-            if (SHOW_REASONING) {
-              let inject = '';
+            let content = delta.content ?? '';
 
-              if (reasoningChunk) {
-                if (!thinkOpen) {
-                  inject += '<think>\n';
-                  thinkOpen = true;
+            if (isNativeThinker && content) {
+              thinkBuffer += content;
+
+              if (!inThink && thinkBuffer.includes('<think>')) {
+                inThink = true;
+                const before = thinkBuffer.split('<think>')[0];
+                thinkBuffer = '';
+                content = before;
+              } else if (inThink) {
+                if (thinkBuffer.includes('</think>')) {
+                  inThink = false;
+                  const after = thinkBuffer.split('</think>').slice(1).join('</think>');
+                  thinkBuffer = '';
+                  content = after.trimStart();
+                } else {
+                  content = '';
                 }
-                inject += reasoningChunk;
+              } else {
+                content = thinkBuffer;
+                thinkBuffer = '';
               }
-
-              if (contentChunk !== null && contentChunk !== '') {
-                if (thinkOpen) {
-                  inject += '\n</think>\n\n';
-                  thinkOpen = false;
-                }
-                inject += contentChunk;
-              }
-
-              delta.content = inject || (contentChunk === '' ? '' : null);
-              // Remove null content to avoid issues
-              if (delta.content === null) delete delta.content;
-            } else {
-              // Hide reasoning — just pass through content
-              if (contentChunk !== null) delta.content = contentChunk;
-              else delta.content = '';
             }
 
-            res.write(`data: ${JSON.stringify(data)}\n\n`);
+            if (content) {
+              streamedContent += content;
+              delta.content = content;
+              res.write(`data: ${JSON.stringify(data)}\n\n`);
+            } else if (!isNativeThinker) {
+              res.write(`data: ${JSON.stringify(data)}\n\n`);
+            }
+
           } catch (e) {
-            // Malformed JSON line — pass through as-is
             res.write(trimmed + '\n');
           }
         }
       });
 
-      response.data.on('end', () => res.end());
+      response.data.on('end', () => {
+        const preview = streamedContent.slice(0, 500) + (streamedContent.length > 500 ? '…' : '');
+        console.log(`[${ts()}] STREAM END`);
+        console.log(`  ASSISTANT: ${preview}`);
+        res.end();
+      });
+
       response.data.on('error', (err) => {
         console.error('Stream error:', err.message);
         res.end();
       });
 
-    // ── Non-streaming ──────────────────────────────────────────────────────
+    // ── Non-streaming ────────────────────────────────────────────────────────
     } else {
       const choices = response.data.choices.map(choice => {
         const msg = choice.message ?? {};
-        let finalContent = msg.content ?? '';
-
-        if (SHOW_REASONING && msg.reasoning_content) {
-          finalContent = `<think>\n${msg.reasoning_content}\n</think>\n\n${finalContent}`;
-        }
+        let content = msg.content ?? '';
+        if (isNativeThinker) content = stripThinking(content);
 
         return {
           index: choice.index,
-          message: {
-            role: msg.role ?? 'assistant',
-            content: finalContent,
-          },
+          message: { role: msg.role ?? 'assistant', content },
           finish_reason: choice.finish_reason,
         };
       });
+
+      console.log(`[${ts()}] RESPONSE (non-stream)`);
+      choices.forEach((c, i) => {
+        const preview = c.message.content.slice(0, 300) + (c.message.content.length > 300 ? '…' : '');
+        console.log(`  [${i}] ASSISTANT: ${preview}`);
+      });
+      console.log(`Usage: ${JSON.stringify(response.data.usage ?? {})}`);
 
       res.json({
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
-        model: model,
+        model,
         choices,
         usage: response.data.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       });
@@ -261,7 +231,6 @@ app.post('/v1/chat/completions', async (req, res) => {
     const status = error.response?.status || 500;
     const detail = error.response?.data || error.message;
     console.error(`Proxy error [${status}]:`, typeof detail === 'object' ? JSON.stringify(detail) : detail);
-
     if (!res.headersSent) {
       res.status(status).json({
         error: {
@@ -274,17 +243,6 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 });
 
-// Helper: build a minimal SSE delta chunk for injecting content mid-stream
-function buildDeltaChunk(model, content) {
-  return {
-    id: `chatcmpl-inject-${Date.now()}`,
-    object: 'chat.completion.chunk',
-    created: Math.floor(Date.now() / 1000),
-    model,
-    choices: [{ index: 0, delta: { content }, finish_reason: null }],
-  };
-}
-
 // 404 fallback
 app.all('*', (req, res) => {
   res.status(404).json({ error: { message: `Endpoint ${req.path} not supported`, type: 'not_found', code: 404 } });
@@ -292,8 +250,7 @@ app.all('*', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`\n🚀 OpenAI → NVIDIA NIM Proxy running on port ${PORT}`);
-  console.log(`   Health:         http://localhost:${PORT}/health`);
-  console.log(`   Reasoning:      ${SHOW_REASONING ? '✅ ENABLED' : '❌ DISABLED'} (set SHOW_REASONING=false to disable)`);
-  console.log(`   Thinking mode:  ${ENABLE_THINKING_MODE ? '✅ ENABLED' : '❌ DISABLED'} (set ENABLE_THINKING_MODE=false to disable)`);
-  console.log(`   NIM API key:    ${NIM_API_KEY ? '✅ SET' : '❌ NOT SET — set NIM_API_KEY env var!'}\n`);
+  console.log(`   Health:      http://localhost:${PORT}/health`);
+  console.log(`   Thinking:    ❌ DISABLED (stripped from all models)`);
+  console.log(`   NIM API key: ${NIM_API_KEY ? '✅ SET' : '❌ NOT SET'}\n`);
 });
