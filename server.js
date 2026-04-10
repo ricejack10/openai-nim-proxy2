@@ -13,21 +13,30 @@ const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.c
 const NIM_API_KEY  = process.env.NIM_API_KEY;
 
 // Model mapping — OpenAI names → NVIDIA NIM model IDs
+// All confirmed present in the hosted LLM API docs as of April 2026
 const MODEL_MAPPING = {
-  'gpt-4':           'qwen/qwen3-235b-a22b',
-  'gpt-3.5-turbo':   'nvidia/llama-3.1-nemotron-ultra-253b-v1',
-  'claude-3-opus':   'qwen/qwen3-235b-a22b',
-  'claude-3-sonnet': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
-  'gpt-4-turbo':     'deepseek-ai/deepseek-r1-distill-qwen-14b',
-  'claude-3-haiku':  'deepseek-ai/deepseek-r1-distill-llama-8b',
-  'gemini-pro':      'deepseek-ai/deepseek-r1-distill-qwen-14b',
-  'gpt-4o':          'deepseek-ai/deepseek-v3.2',
-  'gpt-4o-mini':     'meta/llama-3.3-70b-instruct',
+  // Best for RP/creative writing:
+  'gpt-4':           'qwen/qwen3-235b-a22b',              // confirmed LLM API, strong RP model
+  'claude-3-opus':   'qwen/qwen3-235b-a22b',              // alias
+
+  // Good quality general models:
+  'gpt-3.5-turbo':   'deepseek-ai/deepseek-v3.1-terminus', // hybrid think/non-think, confirmed LLM API
+  'claude-3-sonnet': 'deepseek-ai/deepseek-v3.1-terminus', // alias
+
+  // Fast R1 distill models (native thinkers, think tags are stripped):
+  'gpt-4-turbo':     'deepseek-ai/deepseek-r1-distill-qwen-14b', // confirmed LLM API
+  'claude-3-haiku':  'deepseek-ai/deepseek-r1-distill-llama-8b', // confirmed LLM API
+  'gemini-pro':      'deepseek-ai/deepseek-r1-distill-qwen-7b',  // confirmed LLM API
+
+  // No-frills fast models:
+  'gpt-4o':          'deepseek-ai/deepseek-v3.1',         // confirmed LLM API
+  'gpt-4o-mini':     'meta/llama-3.3-70b-instruct',       // confirmed LLM API, reliable fallback
 };
 
 // These models always output <think> blocks natively — strip them silently
 const NATIVE_THINKERS = new Set([
   'deepseek-ai/deepseek-r1-distill-qwen-14b',
+  'deepseek-ai/deepseek-r1-distill-qwen-7b',
   'deepseek-ai/deepseek-r1-distill-llama-8b',
   'deepseek-ai/deepseek-r1-distill-qwen-32b',
 ]);
