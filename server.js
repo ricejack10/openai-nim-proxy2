@@ -36,7 +36,7 @@ const MODEL_MAPPING = {
   'gemini-pro':      'deepseek-ai/deepseek-r1-distill-qwen-7b',
 
   // Fast, lightweight
-  'gpt-4o':          'deepseek-ai/deepseek-v3.1',
+  'gpt-4o':          'deepseek-ai/deepseek-v3.1-terminus',
   'gpt-4o-mini':     'meta/llama-3.3-70b-instruct',
 };
 
