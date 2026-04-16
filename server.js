@@ -20,34 +20,39 @@ const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.c
 const NIM_API_KEY  = process.env.NIM_API_KEY;
 
 // OpenAI alias -> NVIDIA NIM model ID.
-// All entries confirmed present in the hosted LLM API docs as of April 2026.
+// Updated April 16 2026. Models confirmed against actual API responses,
+// not just the docs page (which lags behind real availability).
+//
+// Currently confirmed live on the hosted API:
+//   deepseek-ai/deepseek-v3.1-terminus  -- best quality, confirmed by user
+//   meta/llama-3.3-70b-instruct         -- long-standing stable model
+//
+// The following families were alive until April 15 2026 but have now
+// returned 410 Gone:
+//   deepseek-ai/deepseek-v3.1
+//   deepseek-ai/deepseek-r1-distill-llama-8b
+//   deepseek-ai/deepseek-r1-distill-qwen-7b   (assumed dead, same cohort)
+//   deepseek-ai/deepseek-r1-distill-qwen-14b  (assumed dead, same cohort)
+//   qwen/qwen3-235b-a22b                       (assumed dead, same cohort)
 const MODEL_MAPPING = {
-  // Best for roleplay and creative writing
-  'gpt-4':           'qwen/qwen3-235b-a22b',
-  'claude-3-opus':   'qwen/qwen3-235b-a22b',
-
-  // Strong general-purpose models
-  'gpt-3.5-turbo':   'deepseek-ai/deepseek-v3.1-terminus',
+  // Primary — best quality available on the hosted API right now
+  'gpt-4':           'deepseek-ai/deepseek-v3.1-terminus',
+  'gpt-4-turbo':     'deepseek-ai/deepseek-v3.1-terminus',
+  'gpt-4o':          'deepseek-ai/deepseek-v3.1-terminus',
+  'claude-3-opus':   'deepseek-ai/deepseek-v3.1-terminus',
   'claude-3-sonnet': 'deepseek-ai/deepseek-v3.1-terminus',
 
-  // R1 distilled reasoning models (think blocks stripped before delivery)
-  'gpt-4-turbo':     'deepseek-ai/deepseek-r1-distill-qwen-14b',
-  'claude-3-haiku':  'deepseek-ai/deepseek-r1-distill-llama-8b',
-  'gemini-pro':      'deepseek-ai/deepseek-r1-distill-qwen-7b',
-
-  // Fast, lightweight
-  'gpt-4o':          'deepseek-ai/deepseek-v3.1-terminus',
+  // Secondary — lighter model, faster responses, good for long conversations
+  'gpt-3.5-turbo':   'meta/llama-3.3-70b-instruct',
   'gpt-4o-mini':     'meta/llama-3.3-70b-instruct',
+  'claude-3-haiku':  'meta/llama-3.3-70b-instruct',
+  'gemini-pro':      'meta/llama-3.3-70b-instruct',
 };
 
-// Models that natively emit <think>...</think> blocks.
-// These blocks are stripped from the response before it reaches the client.
-const NATIVE_THINKERS = new Set([
-  'deepseek-ai/deepseek-r1-distill-qwen-7b',
-  'deepseek-ai/deepseek-r1-distill-qwen-14b',
-  'deepseek-ai/deepseek-r1-distill-qwen-32b',
-  'deepseek-ai/deepseek-r1-distill-llama-8b',
-]);
+// No models currently in the mapping natively emit think blocks,
+// so this set is empty. Kept in place so the stripping logic remains
+// available if reasoning models are added back in future.
+const NATIVE_THINKERS = new Set([]);
 
 // Generation parameters that are safe to forward to any NIM model.
 const FORWARDED_PARAMS = [
