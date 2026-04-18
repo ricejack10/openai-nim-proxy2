@@ -19,46 +19,52 @@ app.use(express.json({ limit: '10mb' }));
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY  = process.env.NIM_API_KEY;
 
+// How many times to retry a request when NIM returns 429, 503, or 504.
+// These are transient congestion errors — a short wait and one retry
+// resolves most of them without the caller ever seeing an error.
+const MAX_RETRIES      = 2;
+const RETRY_DELAY_MS   = 2000; // 2 seconds between retries
+
 // OpenAI alias -> NVIDIA NIM model ID.
-// Updated April 16 2026. Models confirmed against actual API responses,
-// not just the docs page (which lags behind real availability).
 //
-// Currently confirmed live on the hosted API:
-//   deepseek-ai/deepseek-v3.1-terminus  -- best quality, confirmed by user
-//   meta/llama-3.3-70b-instruct         -- long-standing stable model
+// Last verified: April 16 2026.
+// Confirmed live:
+//   deepseek-ai/deepseek-v3.1-terminus  — best quality available
+//   meta/llama-3.3-70b-instruct         — stable lightweight fallback
 //
-// The following families were alive until April 15 2026 but have now
-// returned 410 Gone:
-//   deepseek-ai/deepseek-v3.1
-//   deepseek-ai/deepseek-r1-distill-llama-8b
-//   deepseek-ai/deepseek-r1-distill-qwen-7b   (assumed dead, same cohort)
-//   deepseek-ai/deepseek-r1-distill-qwen-14b  (assumed dead, same cohort)
-//   qwen/qwen3-235b-a22b                       (assumed dead, same cohort)
+// To re-enable reasoning models when new ones appear on the hosted API,
+// add them to NATIVE_THINKERS below and the think-stripping code will
+// activate automatically.
 const MODEL_MAPPING = {
-  // Primary — best quality available on the hosted API right now
+  // Primary — best quality
   'gpt-4':           'deepseek-ai/deepseek-v3.1-terminus',
   'gpt-4-turbo':     'deepseek-ai/deepseek-v3.1-terminus',
   'gpt-4o':          'deepseek-ai/deepseek-v3.1-terminus',
   'claude-3-opus':   'deepseek-ai/deepseek-v3.1-terminus',
   'claude-3-sonnet': 'deepseek-ai/deepseek-v3.1-terminus',
 
-  // Secondary — lighter model, faster responses, good for long conversations
+  // Secondary — faster, lighter, good for long conversations
   'gpt-3.5-turbo':   'meta/llama-3.3-70b-instruct',
   'gpt-4o-mini':     'meta/llama-3.3-70b-instruct',
   'claude-3-haiku':  'meta/llama-3.3-70b-instruct',
   'gemini-pro':      'meta/llama-3.3-70b-instruct',
 };
 
-// No models currently in the mapping natively emit think blocks,
-// so this set is empty. Kept in place so the stripping logic remains
-// available if reasoning models are added back in future.
+// Models that natively emit <think>...</think> blocks which must be stripped.
+// Currently empty because all R1 distill models were retired on April 15 2026.
+// Add future reasoning models here to re-enable stripping.
 const NATIVE_THINKERS = new Set([]);
 
-// Generation parameters that are safe to forward to any NIM model.
+// Generation parameters forwarded verbatim to NIM when present on the request.
 const FORWARDED_PARAMS = [
-  'temperature', 'top_p', 'max_tokens', 'stop',
-  'frequency_penalty', 'presence_penalty', 'seed', 'n',
+  'temperature', 'top_p', 'top_k', 'min_p',
+  'max_tokens', 'stop',
+  'frequency_penalty', 'presence_penalty',
+  'seed', 'n', 'stream_options',
 ];
+
+// HTTP status codes that indicate transient server congestion and are safe to retry.
+const RETRYABLE_STATUSES = new Set([429, 503, 504]);
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -72,19 +78,23 @@ function reqId() {
   return crypto.randomBytes(4).toString('hex');
 }
 
-// Truncate a string for log output.
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Truncate a value to a string for log output.
 function preview(str, limit = 300) {
-  if (typeof str !== 'string') return String(str);
+  if (typeof str !== 'string') str = String(str);
   return str.length > limit ? str.slice(0, limit) + '...' : str;
 }
 
-// Extract a plain-text preview from a message content value, which may be
-// a string or an array of content-part objects (as JanitorAI sometimes sends).
+// Extract a plain-text preview from a message content value.
+// JanitorAI sometimes sends content as an array of typed content-part objects.
 function contentPreview(content) {
   if (typeof content === 'string') return preview(content);
   if (Array.isArray(content)) {
     const text = content
-      .filter(p => p.type === 'text')
+      .filter(p => p && p.type === 'text')
       .map(p => p.text || '')
       .join(' ');
     return preview(text || '[non-text content]');
@@ -92,12 +102,10 @@ function contentPreview(content) {
   return '[non-text content]';
 }
 
-// Strip <think>...</think> blocks from a completed (non-streaming) string.
-// Handles multiple think blocks and unclosed tags at the end.
+// Strip <think>...</think> blocks from a fully buffered string.
+// Handles multiple think blocks and unclosed tags at the end of the string.
 function stripThinkingFull(text) {
-  // Remove complete blocks
   text = text.replace(/<think>[\s\S]*?<\/think>/gi, '');
-  // Remove any unclosed block that reaches end of string
   text = text.replace(/<think>[\s\S]*/gi, '');
   return text.trimStart();
 }
@@ -105,28 +113,23 @@ function stripThinkingFull(text) {
 // ---------------------------------------------------------------------------
 // Streaming think-stripper — state machine
 //
-// Processes one raw content string at a time and returns the portion that
-// should be forwarded to the client. Maintains state across chunks via the
-// returned state object, which the caller must pass back on the next call.
-//
-// State fields:
-//   phase       : 'pass' | 'think'  — whether we are inside a think block
-//   pending     : string            — buffered bytes that might be part of
-//                                     an opening or closing tag boundary
+// Processes content one chunk at a time. Returns the portion safe to forward.
+// The caller must pass the same state object on every subsequent call for
+// the same response so that tag boundaries split across chunks are handled.
 // ---------------------------------------------------------------------------
 
 function makeThinkState() {
   return { phase: 'pass', pending: '' };
 }
 
-// Longest prefix of `needle` that is a suffix of `haystack`.
-// Used to detect tag boundaries split across chunks.
+// Returns the longest prefix of `needle` that is also a suffix of `haystack`.
+// Used to hold back bytes at the end of a chunk that might be the start of a tag.
 function trailingOverlap(haystack, needle) {
   let best = '';
   for (let len = 1; len <= Math.min(haystack.length, needle.length); len++) {
-    const suffix = haystack.slice(haystack.length - len);
-    const prefix = needle.slice(0, len);
-    if (suffix === prefix) best = suffix;
+    if (haystack.slice(haystack.length - len) === needle.slice(0, len)) {
+      best = needle.slice(0, len);
+    }
   }
   return best;
 }
@@ -142,37 +145,23 @@ function processThinkChunk(raw, state) {
     if (state.phase === 'pass') {
       const startTag = '<think>';
       const idx = input.toLowerCase().indexOf(startTag);
-
       if (idx === -1) {
-        // No complete opening tag. Check whether the tail could be the
-        // beginning of one so we do not emit it prematurely.
         const overlap = trailingOverlap(input, startTag);
-        if (overlap.length > 0) {
-          output       += input.slice(0, input.length - overlap.length);
-          state.pending = overlap;
-        } else {
-          output += input;
-        }
+        output       += input.slice(0, input.length - overlap.length);
+        state.pending = overlap;
         input = '';
       } else {
-        // Emit everything before the tag, then enter think phase.
         output += input.slice(0, idx);
         input   = input.slice(idx + startTag.length);
         state.phase = 'think';
       }
-
     } else {
-      // phase === 'think': discard until closing tag
       const endTag = '</think>';
       const idx = input.toLowerCase().indexOf(endTag);
-
       if (idx === -1) {
-        // No closing tag yet; check for partial match at the tail.
-        const overlap = trailingOverlap(input, endTag);
-        state.pending = overlap.length > 0 ? overlap : '';
+        state.pending = trailingOverlap(input, endTag);
         input = '';
       } else {
-        // Exit think phase; resume after the tag, trimming leading whitespace.
         input       = input.slice(idx + endTag.length).replace(/^\s+/, '');
         state.phase = 'pass';
       }
@@ -193,18 +182,39 @@ app.get('/health', (req, res) => {
     nim_base:    NIM_API_BASE,
     api_key_set: !!NIM_API_KEY,
     models:      Object.keys(MODEL_MAPPING).length,
+    max_retries: MAX_RETRIES,
   });
 });
 
 app.get('/v1/models', (req, res) => {
   const data = Object.keys(MODEL_MAPPING).map(id => ({
     id,
-    object:     'model',
-    created:    1700000000,
-    owned_by:   'nvidia-nim-proxy',
+    object:   'model',
+    created:  1700000000,
+    owned_by: 'nvidia-nim-proxy',
   }));
   res.json({ object: 'list', data });
 });
+
+// ---------------------------------------------------------------------------
+// NIM request helper with retry logic
+// ---------------------------------------------------------------------------
+
+async function callNIM(nimBody, isStream, attemptNum, id) {
+  return axios.post(
+    `${NIM_API_BASE}/chat/completions`,
+    nimBody,
+    {
+      headers: {
+        'Authorization': `Bearer ${NIM_API_KEY}`,
+        'Content-Type':  'application/json',
+        'Accept':        isStream ? 'text/event-stream' : 'application/json',
+      },
+      responseType: isStream ? 'stream' : 'json',
+      timeout:      120000,
+    }
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Main proxy endpoint
@@ -213,7 +223,7 @@ app.get('/v1/models', (req, res) => {
 app.post('/v1/chat/completions', async (req, res) => {
   const id = reqId();
 
-  // --- API key check -------------------------------------------------------
+  // --- API key guard --------------------------------------------------------
   if (!NIM_API_KEY) {
     console.error(`[${now()}] [${id}] FATAL: NIM_API_KEY is not set`);
     return res.status(500).json({
@@ -221,7 +231,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
   }
 
-  // --- Basic request validation --------------------------------------------
+  // --- Request validation ---------------------------------------------------
   const { model, messages, stream } = req.body;
 
   if (!model || typeof model !== 'string') {
@@ -236,81 +246,84 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
   }
 
-  // Validate each message has at minimum a role field
   for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    if (!msg || typeof msg.role !== 'string') {
+    if (!messages[i] || typeof messages[i].role !== 'string') {
       return res.status(400).json({
         error: { message: `messages[${i}] is missing a "role" field`, type: 'invalid_request_error', code: 400 },
       });
     }
   }
 
-  // --- Model resolution ----------------------------------------------------
-  const nimModel       = MODEL_MAPPING[model] || model;
+  // --- Model resolution -----------------------------------------------------
+  const nimModel        = MODEL_MAPPING[model] || model;
   const isNativeThinker = NATIVE_THINKERS.has(nimModel);
   const isStream        = !!stream;
 
-  // --- Log the request -----------------------------------------------------
+  // --- Log the incoming request ---------------------------------------------
   console.log(`\n${'─'.repeat(60)}`);
   console.log(`[${now()}] [${id}] REQUEST`);
   console.log(`  Model    : ${model} -> ${nimModel}`);
-  console.log(`  Stream   : ${isStream} | Native thinker: ${isNativeThinker}`);
+  console.log(`  Stream   : ${isStream}`);
   console.log(`  Messages : ${messages.length}`);
   messages.forEach((msg, i) => {
     console.log(`  [${i}] ${msg.role.toUpperCase()}: ${contentPreview(msg.content)}`);
   });
 
-  // --- Build NIM request body ----------------------------------------------
+  // --- Build NIM request body -----------------------------------------------
   const nimBody = { model: nimModel, messages, stream: isStream };
 
-  // Forward whitelisted generation parameters if the caller supplied them.
   for (const param of FORWARDED_PARAMS) {
-    if (req.body[param] !== undefined) {
-      nimBody[param] = req.body[param];
+    if (req.body[param] !== undefined) nimBody[param] = req.body[param];
+  }
+
+  if (nimBody.max_tokens   === undefined) nimBody.max_tokens   = 4096;
+  if (nimBody.temperature  === undefined) nimBody.temperature  = 0.6;
+
+  // --- Call NIM with retry on transient errors ------------------------------
+  // Streaming responses cannot be retried once the response has begun, so
+  // retry only applies to the initial connection attempt.
+  let response;
+  let lastErr;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      response = await callNIM(nimBody, isStream, attempt, id);
+      lastErr  = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      const status = err.response?.status;
+
+      if (attempt < MAX_RETRIES && RETRYABLE_STATUSES.has(status)) {
+        const wait = RETRY_DELAY_MS * (attempt + 1);
+        console.warn(`[${now()}] [${id}] NIM returned ${status}, retrying in ${wait}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        await sleep(wait);
+        continue;
+      }
+
+      // Non-retryable error or retries exhausted
+      break;
     }
   }
 
-  // Apply a sensible default for max_tokens if not provided.
-  if (nimBody.max_tokens === undefined) nimBody.max_tokens = 4096;
-
-  // Apply a sensible default temperature for reasoning-friendly output.
-  if (nimBody.temperature === undefined) nimBody.temperature = 0.6;
-
-  // --- Call NIM ------------------------------------------------------------
-  let response;
-  try {
-    response = await axios.post(
-      `${NIM_API_BASE}/chat/completions`,
-      nimBody,
-      {
-        headers: {
-          'Authorization': `Bearer ${NIM_API_KEY}`,
-          'Content-Type':  'application/json',
-          'Accept':        isStream ? 'text/event-stream' : 'application/json',
-        },
-        responseType: isStream ? 'stream' : 'json',
-        timeout:      120000,
-      }
-    );
-  } catch (err) {
-    return handleAxiosError(err, id, res);
+  if (lastErr) {
+    return handleAxiosError(lastErr, id, res);
   }
 
   // =========================================================================
-  // Streaming path
+  // Streaming response
   // =========================================================================
   if (isStream) {
-    res.setHeader('Content-Type',  'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection',    'keep-alive');
+    res.setHeader('Content-Type',      'text/event-stream');
+    res.setHeader('Cache-Control',     'no-cache');
+    res.setHeader('Connection',        'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
 
     console.log(`[${now()}] [${id}] RESPONSE streaming...`);
 
     let lineBuffer     = '';
     let logAccumulator = '';
-    const thinkState   = makeThinkState();
+    const thinkState   = isNativeThinker ? makeThinkState() : null;
 
     response.data.on('data', (chunk) => {
       lineBuffer += chunk.toString();
@@ -321,24 +334,20 @@ app.post('/v1/chat/completions', async (req, res) => {
         const trimmed = line.trim();
         if (!trimmed) continue;
 
-        // --- DONE sentinel -------------------------------------------------
         if (trimmed === 'data: [DONE]') {
           res.write('data: [DONE]\n\n');
           continue;
         }
 
-        // --- Non-data lines (comments, etc.) --------------------------------
         if (!trimmed.startsWith('data: ')) {
           res.write(line + '\n');
           continue;
         }
 
-        // --- Parse SSE data line -------------------------------------------
         let parsed;
         try {
           parsed = JSON.parse(trimmed.slice(6));
         } catch (_) {
-          // Malformed JSON — forward as-is and continue
           res.write(line + '\n');
           continue;
         }
@@ -349,21 +358,16 @@ app.post('/v1/chat/completions', async (req, res) => {
           continue;
         }
 
-        // Always remove reasoning_content — clients do not expect it
         delete delta.reasoning_content;
 
         let content = typeof delta.content === 'string' ? delta.content : '';
 
-        // Strip think blocks from native thinkers
         if (isNativeThinker) {
           content = processThinkChunk(content, thinkState);
         }
 
-        // Only emit the chunk if there is visible content to send, or if
-        // this is a non-thinker (where empty role/finish_reason chunks
-        // must still be forwarded so the client can track turn boundaries).
         if (content || !isNativeThinker) {
-          delta.content = content;
+          delta.content   = content;
           logAccumulator += content;
           res.write(`data: ${JSON.stringify(parsed)}\n\n`);
         }
@@ -371,15 +375,13 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
 
     response.data.on('end', () => {
-      // Flush any pending buffer content (e.g. a trailing partial tag that
-      // never resolved — emit it as-is so the response is not silently cut)
+      // Flush any think-state pending buffer (trailing partial tag in pass phase)
       if (isNativeThinker && thinkState.pending && thinkState.phase === 'pass') {
         const flush = thinkState.pending;
-        thinkState.pending = '';
         if (flush) {
           const flushChunk = {
-            id: `chatcmpl-${Date.now()}`,
-            object: 'chat.completion.chunk',
+            id:      `chatcmpl-${Date.now()}`,
+            object:  'chat.completion.chunk',
             created: Math.floor(Date.now() / 1000),
             model,
             choices: [{ index: 0, delta: { content: flush }, finish_reason: null }],
@@ -396,33 +398,24 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     response.data.on('error', (err) => {
       console.error(`[${now()}] [${id}] STREAM ERROR: ${err.message}`);
-      // Send a structured error event so the client knows something went wrong
       if (!res.writableEnded) {
-        const errEvent = {
-          error: { message: `Stream error: ${err.message}`, type: 'stream_error' },
-        };
-        res.write(`data: ${JSON.stringify(errEvent)}\n\n`);
+        res.write(`data: ${JSON.stringify({ error: { message: `Stream error: ${err.message}`, type: 'stream_error' } })}\n\n`);
         res.write('data: [DONE]\n\n');
         res.end();
       }
     });
 
-    return; // response handled asynchronously
+    return;
   }
 
   // =========================================================================
-  // Non-streaming path
+  // Non-streaming response
   // =========================================================================
   const choices = (response.data.choices || []).map(choice => {
     const msg = choice.message ?? {};
     let content = msg.content ?? '';
 
-    // Strip think blocks from native thinkers
-    if (isNativeThinker) {
-      content = stripThinkingFull(content);
-    }
-
-    // Some models return reasoning in a separate field — always discard it
+    if (isNativeThinker) content = stripThinkingFull(content);
     delete msg.reasoning_content;
 
     return {
@@ -432,14 +425,10 @@ app.post('/v1/chat/completions', async (req, res) => {
     };
   });
 
-  const usage = response.data.usage ?? {
-    prompt_tokens: 0, completion_tokens: 0, total_tokens: 0,
-  };
+  const usage = response.data.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
 
   console.log(`[${now()}] [${id}] RESPONSE (non-stream)`);
-  choices.forEach((c, i) => {
-    console.log(`  [${i}] ASSISTANT: ${preview(c.message.content)}`);
-  });
+  choices.forEach((c, i) => console.log(`  [${i}] ASSISTANT: ${preview(c.message.content)}`));
   console.log(`  Usage: prompt=${usage.prompt_tokens} completion=${usage.completion_tokens} total=${usage.total_tokens}`);
 
   return res.json({
@@ -463,32 +452,34 @@ app.all('*', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Error handling helpers
+// Error handling
 // ---------------------------------------------------------------------------
 
 function handleAxiosError(err, id, res) {
-  const status = err.response?.status || 500;
+  const status = err.response?.status;
   let detail   = err.message;
 
-  if (err.response?.data) {
+  // Distinguish timeout and connection reset from API errors for clearer logs
+  if (err.code === 'ECONNABORTED') {
+    detail = `Request timed out after ${Math.round(120000 / 1000)}s with no response from NIM`;
+  } else if (err.code === 'ECONNRESET') {
+    detail = 'NIM closed the connection unexpectedly (likely server-side congestion)';
+  } else if (err.response?.data) {
     const raw = err.response.data;
-    if (typeof raw === 'string') {
-      detail = raw;
-    } else if (Buffer.isBuffer(raw)) {
-      detail = raw.toString('utf8');
-    } else if (typeof raw === 'object') {
-      detail = JSON.stringify(raw);
-    }
+    if (typeof raw === 'string')       detail = raw;
+    else if (Buffer.isBuffer(raw))     detail = raw.toString('utf8');
+    else if (typeof raw === 'object')  detail = JSON.stringify(raw);
   }
 
-  console.error(`[${now()}] [${id}] PROXY ERROR [${status}]: ${preview(detail, 500)}`);
+  const httpStatus = status || 500;
+  console.error(`[${now()}] [${id}] PROXY ERROR [${httpStatus}]: ${preview(detail, 500)}`);
 
   if (!res.headersSent) {
-    res.status(status).json({
+    res.status(httpStatus).json({
       error: {
         message: detail || 'An error occurred communicating with the NIM API',
-        type:    status >= 500 ? 'server_error' : 'invalid_request_error',
-        code:    status,
+        type:    httpStatus >= 500 ? 'server_error' : 'invalid_request_error',
+        code:    httpStatus,
       },
     });
   }
@@ -500,10 +491,11 @@ function handleAxiosError(err, id, res) {
 
 app.listen(PORT, () => {
   console.log('');
-  console.log(`OpenAI to NVIDIA NIM Proxy`);
-  console.log(`  Port    : ${PORT}`);
-  console.log(`  Health  : http://localhost:${PORT}/health`);
-  console.log(`  API key : ${NIM_API_KEY ? 'SET' : 'NOT SET -- set NIM_API_KEY environment variable'}`);
-  console.log(`  Models  : ${Object.keys(MODEL_MAPPING).length} mapped`);
+  console.log('OpenAI to NVIDIA NIM Proxy');
+  console.log(`  Port        : ${PORT}`);
+  console.log(`  Health      : http://localhost:${PORT}/health`);
+  console.log(`  API key     : ${NIM_API_KEY ? 'SET' : 'NOT SET -- set NIM_API_KEY environment variable'}`);
+  console.log(`  Models      : ${Object.keys(MODEL_MAPPING).length} mapped`);
+  console.log(`  Max retries : ${MAX_RETRIES} (on 429/503/504)`);
   console.log('');
 });
