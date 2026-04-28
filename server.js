@@ -27,96 +27,76 @@ const RETRY_DELAY_MS   = 2000; // 2 seconds between retries
 
 // OpenAI alias -> NVIDIA NIM model ID.
 //
-// Last verified: April 22 2026 against docs.api.nvidia.com/nim/reference/llm-apis
+// Last verified: April 22 2026.
 //
-// EXCLUDED (not useful for general chat / roleplay):
-//   - Safety/guard models (nemoguard, shieldgemma, gliner-pii)
-//   - Math-only models (phi-4-mini-flash-reasoning, mathstral-7b)
-//   - Code-only models (codestral, starcoder2, codegemma, devstral, codellama)
-//   - Embedding models
-//   - Base models without instruction tuning (mistral-nemo-minitron-8b-base)
-//   - Very small models under 8B (llama-3.2-1b, llama-3.2-3b, gemma-2-2b)
-//   - Old generation models (llama2-70b, llama3-8b, gemma-7b, mistral-7b v0.1)
+// These aliases exist purely as convenient short names for JanitorAI's model
+// field. You can also skip the mapping entirely and type a NIM model ID
+// directly (e.g. deepseek-ai/deepseek-v3.1-terminus) — any ID not found
+// here is forwarded to NIM unchanged.
 //
-// NATIVE_THINKERS below lists models that emit <think>...</think> inline in
-// their content field. Those blocks are stripped before delivery.
-// Models that return reasoning in a separate reasoning_content field are handled
-// automatically by the existing delete delta.reasoning_content line.
+// EXCLUDED from the list (not suitable for general chat / roleplay):
+//   Safety and guard models, math-only models, code-only models,
+//   embedding models, base models, models under 8B parameters,
+//   and first-generation models predating Llama 3.
 const MODEL_MAPPING = {
 
-  // -------------------------------------------------------------------------
-  // Primary aliases — type these in JanitorAI
-  // -------------------------------------------------------------------------
+  // --- DeepSeek -----------------------------------------------------------
+  'deepseek-terminus':   'deepseek-ai/deepseek-v3.1-terminus',  // 685B MoE, confirmed live
+  'deepseek-v3':         'deepseek-ai/deepseek-v3.2',           // 685B, may be intermittent
 
-  // Best all-round quality for roleplay, confirmed working
-  'gpt-4':              'deepseek-ai/deepseek-v3.1-terminus',
-  'gpt-4-turbo':        'moonshotai/kimi-k2-instruct-0905',
-  'gpt-4o':             'deepseek-ai/deepseek-v3.1-terminus',
-  'claude-3-opus':      'moonshotai/kimi-k2-instruct-0905',
-  'claude-3-sonnet':    'mistralai/mistral-2-large-instruct',
+  // --- Kimi (Moonshot AI) -------------------------------------------------
+  'kimi-k2':             'moonshotai/kimi-k2-instruct-0905',    // 1T param MoE instruct
+  'kimi-k2-think':       'moonshotai/kimi-k2-thinking',         // thinking variant (reasoning_content stripped)
 
-  // Faster / lighter fallbacks
-  'gpt-3.5-turbo':      'meta/llama-3.3-70b-instruct',
-  'gpt-4o-mini':        'meta/llama-3.3-70b-instruct',
-  'claude-3-haiku':     'nvidia/llama-3.3-nemotron-super-49b-v1',
-  'gemini-pro':         'nvidia/llama-3.3-nemotron-super-49b-v1',
+  // --- Mistral ------------------------------------------------------------
+  'mistral-large':       'mistralai/mistral-2-large-instruct',  // 123B
+  'mistral-small':       'mistralai/mistral-small-24b-instruct', // 24B, fast
+  'mistral-nemotron':    'mistralai/mistral-nemotron',           // Mistral x NVIDIA
+  'mixtral-8x22b':       'mistralai/mixtral-8x22b-instruct',    // 141B MoE
+  'mixtral-8x7b':        'mistralai/mixtral-8x7b-instruct',     // 47B MoE, lightweight
+  'magistral':           'mistralai/magistral-small-2506',       // reasoning model (reasoning_content stripped)
 
-  // -------------------------------------------------------------------------
-  // Additional aliases — enter these directly in JanitorAI's model field
-  // -------------------------------------------------------------------------
+  // --- MiniMax ------------------------------------------------------------
+  'minimax-m2':          'minimaxai/minimax-m2.5',              // inline <think> tags stripped
+  'minimax-m3':          'minimaxai/minimax-m2.7',              // newer version, inline <think> stripped
 
-  // DeepSeek family
-  'deepseek-terminus':  'deepseek-ai/deepseek-v3.1-terminus',  // 685B MoE, confirmed live
-  'deepseek-v3':        'deepseek-ai/deepseek-v3.2',           // 685B, listed in docs (may be flaky)
+  // --- NVIDIA Nemotron ----------------------------------------------------
+  'nemotron-49b':        'nvidia/llama-3.3-nemotron-super-49b-v1',   // 49B reasoning+chat
+  'nemotron-49b-v2':     'nvidia/llama-3.3-nemotron-super-49b-v1.5', // 49B upgraded, <think> stripped
+  'nemotron-253b':       'nvidia/llama-3.1-nemotron-ultra-253b-v1',  // 253B, highest quality NVIDIA model
+  'nemotron-nano':       'nvidia/nemotron-3-nano-30b-a3b',            // 30B active MoE, fast, <think> stripped
 
-  // Kimi K2 family — 1 trillion parameter MoE, very strong
-  'kimi-k2':            'moonshotai/kimi-k2-instruct-0905',    // instruct, 128K context
-  'kimi-k2-think':      'moonshotai/kimi-k2-thinking',         // reasoning (think in separate field, stripped)
+  // --- Meta Llama ---------------------------------------------------------
+  'llama-405b':          'meta/llama-3.1-405b-instruct',        // 405B
+  'llama-70b':           'meta/llama-3.3-70b-instruct',         // 70B, stable and reliable
+  'llama-70b-3.1':       'meta/llama-3.1-70b-instruct',         // older 70B
 
-  // Mistral family
-  'mistral-large':      'mistralai/mistral-2-large-instruct',  // 123B
-  'mistral-small':      'mistralai/mistral-small-24b-instruct', // 24B, fast
-  'mistral-nemotron':   'mistralai/mistral-nemotron',           // Mistral x NVIDIA collab
-  'mixtral-8x22b':      'mistralai/mixtral-8x22b-instruct',    // 141B MoE
-  'mixtral-8x7b':       'mistralai/mixtral-8x7b-instruct',     // 47B MoE, lightweight
-  'magistral':          'mistralai/magistral-small-2506',       // reasoning-capable, think in separate field
+  // --- ZhipuAI GLM --------------------------------------------------------
+  // WARNING: These models have previously caused instance crashes on Render.
+  // Their response format may deviate from the OpenAI spec. If Render shows
+  // "instance failed" after adding these, remove them immediately.
+  'glm-5':           'zhipuai/glm-5.1',                     // 744B, flagship
+  'glm-4':           'zhipuai/glm-4.7',                     // lighter, multilingual
 
-  // MiniMax family — uses inline <think> tags (stripped)
-  'minimax':            'minimaxai/minimax-m2.7',              // latest, agentic
-  'minimax-m2':         'minimaxai/minimax-m2.5',              // stable version
-
-  // NVIDIA Nemotron family
-  'nemotron-super':     'nvidia/llama-3.3-nemotron-super-49b-v1',   // 49B, good general model
-  'nemotron-super-v2':  'nvidia/llama-3.3-nemotron-super-49b-v1.5', // 49B upgraded (think tags, stripped)
-  'nemotron-ultra':     'nvidia/llama-3.1-nemotron-ultra-253b-v1',  // 253B, high quality
-  'nemotron-nano':      'nvidia/nemotron-3-nano-30b-a3b',            // 30B active, hybrid MoE, fast
-
-  // Meta Llama family
-  'llama-405b':         'meta/llama-3.1-405b-instruct',        // 405B, very large
-  'llama-70b':          'meta/llama-3.3-70b-instruct',         // 70B, reliable
-  'llama-70b-old':      'meta/llama-3.1-70b-instruct',         // older 70B
-
-  // ByteDance
-  'seed-36b':           'bytedance/seed-oss-36b-instruct',     // 36B general model
-
-  // Miscellaneous
-  'dracarys':           'abacusai/dracarys-llama-3.1-70b-instruct', // fine-tuned for helpfulness
-  'marin':              'marin/marin-8b-instruct',             // 8B, lightweight option
+  // --- Other --------------------------------------------------------------
+  'seed-36b':            'bytedance/seed-oss-36b-instruct',     // ByteDance 36B
+  'dracarys-70b':        'abacusai/dracarys-llama-3.1-70b-instruct', // fine-tuned for helpfulness
+  'marin-8b':            'marin/marin-8b-instruct',             // 8B, smallest/fastest option
 };
 
 // Models that emit <think>...</think> blocks inline inside their content field.
-// These blocks are stripped before the response reaches the client.
-// Note: models that return reasoning in a separate reasoning_content field
-// (e.g. kimi-k2-thinking, magistral) do NOT need to be listed here — the
-// existing `delete delta.reasoning_content` line already handles them.
+// Those blocks are stripped before the response reaches the client.
+//
+// Models that return reasoning in a separate reasoning_content field
+// (kimi-k2-thinking, magistral, etc.) do not need to be listed here —
+// the existing `delete delta.reasoning_content` already handles them.
 const NATIVE_THINKERS = new Set([
   'minimaxai/minimax-m2.5',
   'minimaxai/minimax-m2.7',
   'nvidia/nemotron-3-nano-30b-a3b',
   'nvidia/nemotron-3-super-120b-a12b',
-  'nvidia/llama-3.3-nemotron-super-49b-v1.5', // thinks by default without system prompt
-  // 49b-v1 may also emit think tags depending on system prompt — include to be safe
   'nvidia/llama-3.3-nemotron-super-49b-v1',
+  'nvidia/llama-3.3-nemotron-super-49b-v1.5',
 ]);
 
 // Generation parameters forwarded verbatim to NIM when present on the request.
