@@ -20,10 +20,26 @@ const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.c
 const NIM_API_KEY  = process.env.NIM_API_KEY;
 
 // How many times to retry a request when NIM returns 429, 503, or 504.
-// These are transient congestion errors — a short wait and one retry
-// resolves most of them without the caller ever seeing an error.
-const MAX_RETRIES      = 2;
-const RETRY_DELAY_MS   = 2000; // 2 seconds between retries
+const MAX_RETRIES    = 2;
+const RETRY_DELAY_MS = 500; // reduced from 2000ms — retry faster within JanitorAI's patience window
+
+// Per-model token limits. Large models on shared infrastructure generate slowly —
+// capping tokens to what RP actually needs reduces time-to-completion significantly.
+const MODEL_MAX_TOKENS = {
+  'deepseek-ai/deepseek-v3.1-terminus': 800,
+  'deepseek-ai/deepseek-v3.2':          800,
+  'moonshotai/kimi-k2-instruct-0905':   800,
+  'moonshotai/kimi-k2-thinking':        800,
+  'zhipuai/glm-5.1':                    800,
+  'zhipuai/glm-4.7':                    800,
+  'meta/llama-3.1-405b-instruct':       800,
+  // Smaller/faster models can afford more tokens without meaningful slowdown
+  'meta/llama-3.3-70b-instruct':        2048,
+  'meta/llama-3.1-70b-instruct':        2048,
+  'mistralai/mistral-small-24b-instruct': 2048,
+  'nvidia/nemotron-3-nano-30b-a3b':     2048,
+  'marin/marin-8b-instruct':            2048,
+};
 
 // OpenAI alias -> NVIDIA NIM model ID.
 //
@@ -255,7 +271,7 @@ async function callNIM(nimBody, isStream, attemptNum, id) {
         'Accept':        isStream ? 'text/event-stream' : 'application/json',
       },
       responseType: isStream ? 'stream' : 'json',
-      timeout:      120000,
+      timeout:      180000,
     }
   );
 }
@@ -320,7 +336,9 @@ app.post('/v1/chat/completions', async (req, res) => {
     if (req.body[param] !== undefined) nimBody[param] = req.body[param];
   }
 
-  if (nimBody.max_tokens   === undefined) nimBody.max_tokens   = 4096;
+  if (nimBody.max_tokens  === undefined) {
+    nimBody.max_tokens = MODEL_MAX_TOKENS[nimModel] ?? 4096;
+  }
   if (nimBody.temperature  === undefined) nimBody.temperature  = 0.6;
 
   // --- Call NIM with retry on transient errors ------------------------------
@@ -505,7 +523,7 @@ function handleAxiosError(err, id, res) {
 
   // Distinguish timeout and connection reset from API errors for clearer logs
   if (err.code === 'ECONNABORTED') {
-    detail = `Request timed out after ${Math.round(120000 / 1000)}s with no response from NIM`;
+    detail = `Request timed out after ${Math.round(180000 / 1000)}s with no response from NIM`;
   } else if (err.code === 'ECONNRESET') {
     detail = 'NIM closed the connection unexpectedly (likely server-side congestion)';
   } else if (err.response?.data) {
