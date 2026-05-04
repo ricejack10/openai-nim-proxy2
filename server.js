@@ -28,92 +28,28 @@ const RETRY_DELAY_MS = 500; // reduced from 2000ms — retry faster within Janit
 const MODEL_MAX_TOKENS = {
   'deepseek-ai/deepseek-v3.1-terminus': 800,
   'deepseek-ai/deepseek-v3.2':          800,
-  'moonshotai/kimi-k2-instruct-0905':   800,
-  'moonshotai/kimi-k2-thinking':        800,
-  'zhipuai/glm-5.1':                    800,
-  'zhipuai/glm-4.7':                    800,
-  'meta/llama-3.1-405b-instruct':       800,
-  // Smaller/faster models can afford more tokens without meaningful slowdown
-  'meta/llama-3.3-70b-instruct':        2048,
-  'meta/llama-3.1-70b-instruct':        2048,
-  'mistralai/mistral-small-24b-instruct': 2048,
-  'nvidia/nemotron-3-nano-30b-a3b':     2048,
-  'marin/marin-8b-instruct':            2048,
+  'deepseek-ai/deepseek-v4-pro':        800,
+  'deepseek-ai/deepseek-v4-flash':      800,
 };
 
 // OpenAI alias -> NVIDIA NIM model ID.
-//
-// Last verified: April 22 2026.
-//
-// These aliases exist purely as convenient short names for JanitorAI's model
-// field. You can also skip the mapping entirely and type a NIM model ID
-// directly (e.g. deepseek-ai/deepseek-v3.1-terminus) — any ID not found
-// here is forwarded to NIM unchanged.
-//
-// EXCLUDED from the list (not suitable for general chat / roleplay):
-//   Safety and guard models, math-only models, code-only models,
-//   embedding models, base models, models under 8B parameters,
-//   and first-generation models predating Llama 3.
+// Last verified: May 2026.
 const MODEL_MAPPING = {
-
-  // --- DeepSeek -----------------------------------------------------------
-  'deepseek-terminus':   'deepseek-ai/deepseek-v3.1-terminus',  // 685B MoE, confirmed live
-  'deepseek-v3':         'deepseek-ai/deepseek-v3.2',           // 685B, may be intermittent
-
-  // --- Kimi (Moonshot AI) -------------------------------------------------
-  'kimi-k2':             'moonshotai/kimi-k2-instruct-0905',    // 1T param MoE instruct
-  'kimi-k2-think':       'moonshotai/kimi-k2-thinking',         // thinking variant (reasoning_content stripped)
-
-  // --- Mistral ------------------------------------------------------------
-  'mistral-large':       'mistralai/mistral-2-large-instruct',  // 123B
-  'mistral-small':       'mistralai/mistral-small-24b-instruct', // 24B, fast
-  'mistral-nemotron':    'mistralai/mistral-nemotron',           // Mistral x NVIDIA
-  'mixtral-8x22b':       'mistralai/mixtral-8x22b-instruct',    // 141B MoE
-  'mixtral-8x7b':        'mistralai/mixtral-8x7b-instruct',     // 47B MoE, lightweight
-  'magistral':           'mistralai/magistral-small-2506',       // reasoning model (reasoning_content stripped)
-
-  // --- MiniMax ------------------------------------------------------------
-  'minimax-m2':          'minimaxai/minimax-m2.5',              // inline <think> tags stripped
-  'minimax-m3':          'minimaxai/minimax-m2.7',              // newer version, inline <think> stripped
-
-  // --- NVIDIA Nemotron ----------------------------------------------------
-  'nemotron-49b':        'nvidia/llama-3.3-nemotron-super-49b-v1',   // 49B reasoning+chat
-  'nemotron-49b-v2':     'nvidia/llama-3.3-nemotron-super-49b-v1.5', // 49B upgraded, <think> stripped
-  'nemotron-253b':       'nvidia/llama-3.1-nemotron-ultra-253b-v1',  // 253B, highest quality NVIDIA model
-  'nemotron-nano':       'nvidia/nemotron-3-nano-30b-a3b',            // 30B active MoE, fast, <think> stripped
-
-  // --- Meta Llama ---------------------------------------------------------
-  'llama-405b':          'meta/llama-3.1-405b-instruct',        // 405B
-  'llama-70b':           'meta/llama-3.3-70b-instruct',         // 70B, stable and reliable
-  'llama-70b-3.1':       'meta/llama-3.1-70b-instruct',         // older 70B
-
-  // --- ZhipuAI GLM --------------------------------------------------------
-  // WARNING: These models have previously caused instance crashes on Render.
-  // Their response format may deviate from the OpenAI spec. If Render shows
-  // "instance failed" after adding these, remove them immediately.
-  'glm-5':           'zhipuai/glm-5.1',                     // 744B, flagship
-  'glm-4':           'zhipuai/glm-4.7',                     // lighter, multilingual
-
-  // --- Other --------------------------------------------------------------
-  'seed-36b':            'bytedance/seed-oss-36b-instruct',     // ByteDance 36B
-  'dracarys-70b':        'abacusai/dracarys-llama-3.1-70b-instruct', // fine-tuned for helpfulness
-  'marin-8b':            'marin/marin-8b-instruct',             // 8B, smallest/fastest option
+  'deepseek-terminus':  'deepseek-ai/deepseek-v3.1-terminus',
+  'deepseek-v3':        'deepseek-ai/deepseek-v3.2',
+  'deepseek-v4':        'deepseek-ai/deepseek-v4-pro',    // 1.6T params, 49B active, 1M context — newest
+  'deepseek-v4-flash':  'deepseek-ai/deepseek-v4-flash',  // 284B params, 13B active — faster V4
 };
 
-// Models that emit <think>...</think> blocks inline inside their content field.
-// Those blocks are stripped before the response reaches the client.
-//
-// Models that return reasoning in a separate reasoning_content field
-// (kimi-k2-thinking, magistral, etc.) do not need to be listed here —
-// the existing `delete delta.reasoning_content` already handles them.
-const NATIVE_THINKERS = new Set([
-  'minimaxai/minimax-m2.5',
-  'minimaxai/minimax-m2.7',
-  'nvidia/nemotron-3-nano-30b-a3b',
-  'nvidia/nemotron-3-super-120b-a12b',
-  'nvidia/llama-3.3-nemotron-super-49b-v1',
-  'nvidia/llama-3.3-nemotron-super-49b-v1.5',
+// V4 models hang permanently without chat_template_kwargs injected into the request body.
+// Their reasoning output goes into reasoning_content (already stripped), not inline.
+const REQUIRES_THINKING_PARAM = new Set([
+  'deepseek-ai/deepseek-v4-pro',
+  'deepseek-ai/deepseek-v4-flash',
 ]);
+
+// No current models emit inline <think> tags in their content field.
+const NATIVE_THINKERS = new Set([]);
 
 // Generation parameters forwarded verbatim to NIM when present on the request.
 const FORWARDED_PARAMS = [
@@ -341,6 +277,12 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
   if (nimBody.temperature  === undefined) nimBody.temperature  = 0.6;
 
+  // V4 models hang permanently without this parameter — inject it unconditionally.
+  // Reasoning output arrives in reasoning_content and is stripped before delivery.
+  if (REQUIRES_THINKING_PARAM.has(nimModel)) {
+    nimBody.chat_template_kwargs = { enable_thinking: true, thinking: true };
+  }
+
   // --- Call NIM with retry on transient errors ------------------------------
   // Streaming responses cannot be retried once the response has begun, so
   // retry only applies to the initial connection attempt.
@@ -530,7 +472,20 @@ function handleAxiosError(err, id, res) {
     const raw = err.response.data;
     if (typeof raw === 'string')       detail = raw;
     else if (Buffer.isBuffer(raw))     detail = raw.toString('utf8');
-    else if (typeof raw === 'object')  detail = JSON.stringify(raw);
+    else if (typeof raw === 'object') {
+      try {
+        const seen = new WeakSet();
+        detail = JSON.stringify(raw, (key, value) => {
+          if (typeof value === 'object' && value !== null) {
+            if (seen.has(value)) return '[Circular]';
+            seen.add(value);
+          }
+          return value;
+        });
+      } catch (_) {
+        detail = `[Unserializable error object: ${raw?.constructor?.name || 'unknown'}]`;
+      }
+    }
   }
 
   const httpStatus = status || 500;
