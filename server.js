@@ -32,27 +32,28 @@ const REQUEST_TIMEOUT_MS = 20000;
 
 // Per-model token limits.
 const MODEL_MAX_TOKENS = {
-  'deepseek-ai/deepseek-v3.2':          800,
-  'deepseek-ai/deepseek-v4-pro':        800,
-  'deepseek-ai/deepseek-v4-flash':      800,
+  'deepseek-ai/deepseek-v4-pro':   800,
+  'deepseek-ai/deepseek-v4-flash': 800,
 };
 
-// Model to fall back to if the primary model times out.
+// If V4-pro times out, try V4-flash before giving up.
+// V3.x models all retired as of May 4 2026 — no older fallback available.
 const FALLBACK_MODEL = {
-  'deepseek-ai/deepseek-v4-pro':   'deepseek-ai/deepseek-v3.2',
-  'deepseek-ai/deepseek-v4-flash': 'deepseek-ai/deepseek-v3.2',
+  'deepseek-ai/deepseek-v4-pro': 'deepseek-ai/deepseek-v4-flash',
 };
 
 // OpenAI alias -> NVIDIA NIM model ID.
 // Last verified: May 9 2026.
-// deepseek-v3.1-terminus retired April 15 2026 (410 Gone).
+// v3.1-terminus retired April 15 2026, v3.2 retired May 4 2026 — both 410 Gone.
+// V4 models are the only live DeepSeek models on the hosted NIM API.
 const MODEL_MAPPING = {
-  'deepseek-v3':       'deepseek-ai/deepseek-v3.2',
-  'deepseek-v4':       'deepseek-ai/deepseek-v4-pro',
-  'deepseek-v4-flash': 'deepseek-ai/deepseek-v4-flash',
+  'deepseek-v4':       'deepseek-ai/deepseek-v4-pro',    // 1.6T params, 49B active
+  'deepseek-v4-flash': 'deepseek-ai/deepseek-v4-flash',  // 284B params, 13B active — faster
 };
 
-// V4 models hang without this injected — reasoning arrives in reasoning_content (already stripped).
+// V4 models require chat_template_kwargs to respond at all.
+// enable_thinking: false = Non-think (fast) mode — responses start immediately.
+// enable_thinking: true  = Think High/Max — model reasons before responding, causes timeouts.
 const REQUIRES_THINKING_PARAM = new Set([
   'deepseek-ai/deepseek-v4-pro',
   'deepseek-ai/deepseek-v4-flash',
@@ -301,12 +302,13 @@ app.post('/v1/chat/completions', async (req, res) => {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     nimBody.model = activeModel;
 
-    // Re-apply thinking param check in case we fell back to a non-V4 model
-    if (REQUIRES_THINKING_PARAM.has(activeModel)) {
-      nimBody.chat_template_kwargs = { enable_thinking: true, thinking: true };
-    } else {
-      delete nimBody.chat_template_kwargs;
-    }
+  // V4 models require this parameter or they hang indefinitely.
+  // enable_thinking: false = Non-think (fast) mode, responses start immediately.
+  if (REQUIRES_THINKING_PARAM.has(activeModel)) {
+    nimBody.chat_template_kwargs = { enable_thinking: false, thinking: false };
+  } else {
+    delete nimBody.chat_template_kwargs;
+  }
 
     try {
       response = await callNIM(nimBody, isStream, id);
