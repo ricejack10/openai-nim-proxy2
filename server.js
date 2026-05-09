@@ -32,26 +32,24 @@ const REQUEST_TIMEOUT_MS = 20000;
 
 // Per-model token limits.
 const MODEL_MAX_TOKENS = {
-  'deepseek-ai/deepseek-v3.1-terminus': 800,
   'deepseek-ai/deepseek-v3.2':          800,
   'deepseek-ai/deepseek-v4-pro':        800,
   'deepseek-ai/deepseek-v4-flash':      800,
 };
 
-// Model to fall back to if the primary model times out or returns 5xx.
-// V4 models are new and unreliable — fall back to terminus which is confirmed stable.
+// Model to fall back to if the primary model times out.
 const FALLBACK_MODEL = {
-  'deepseek-ai/deepseek-v4-pro':   'deepseek-ai/deepseek-v3.1-terminus',
-  'deepseek-ai/deepseek-v4-flash': 'deepseek-ai/deepseek-v3.1-terminus',
+  'deepseek-ai/deepseek-v4-pro':   'deepseek-ai/deepseek-v3.2',
+  'deepseek-ai/deepseek-v4-flash': 'deepseek-ai/deepseek-v3.2',
 };
 
 // OpenAI alias -> NVIDIA NIM model ID.
-// Last verified: May 2026.
+// Last verified: May 9 2026.
+// deepseek-v3.1-terminus retired April 15 2026 (410 Gone).
 const MODEL_MAPPING = {
-  'deepseek-terminus':  'deepseek-ai/deepseek-v3.1-terminus',
-  'deepseek-v3':        'deepseek-ai/deepseek-v3.2',
-  'deepseek-v4':        'deepseek-ai/deepseek-v4-pro',
-  'deepseek-v4-flash':  'deepseek-ai/deepseek-v4-flash',
+  'deepseek-v3':       'deepseek-ai/deepseek-v3.2',
+  'deepseek-v4':       'deepseek-ai/deepseek-v4-pro',
+  'deepseek-v4-flash': 'deepseek-ai/deepseek-v4-flash',
 };
 
 // V4 models hang without this injected — reasoning arrives in reasoning_content (already stripped).
@@ -502,9 +500,27 @@ function handleAxiosError(err, id, res) {
     detail = 'NIM closed the connection unexpectedly (likely server-side congestion)';
   } else if (err.response?.data) {
     const raw = err.response.data;
-    if (typeof raw === 'string')       detail = raw;
-    else if (Buffer.isBuffer(raw))     detail = raw.toString('utf8');
-    else if (typeof raw === 'object') {
+    if (typeof raw === 'string') {
+      detail = raw;
+    } else if (Buffer.isBuffer(raw)) {
+      detail = raw.toString('utf8');
+    } else if (raw && typeof raw.read === 'function') {
+      // Readable stream — happens when responseType is 'stream' and NIM returns a 4xx/5xx.
+      // The error body is already buffered internally; read it out synchronously.
+      try {
+        const chunks = [];
+        let chunk;
+        while (null !== (chunk = raw.read())) {
+          chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+        }
+        detail = chunks.length > 0
+          ? Buffer.concat(chunks).toString('utf8')
+          : `[Empty stream body — HTTP ${status}]`;
+      } catch (_) {
+        detail = `[Could not read stream error body — HTTP ${status}]`;
+      }
+    } else if (typeof raw === 'object') {
+      // Plain object — safe to stringify with circular reference guard
       try {
         const seen = new WeakSet();
         detail = JSON.stringify(raw, (key, value) => {
