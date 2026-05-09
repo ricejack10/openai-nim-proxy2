@@ -25,10 +25,11 @@ const NIM_API_KEY  = process.env.NIM_API_KEY;
 const MAX_RETRIES    = 2;
 const RETRY_DELAY_MS = 500;
 
-// Render's free tier kills incoming HTTP connections after ~25 seconds.
-// Axios timeout must stay below that or Render returns 502 before the
-// proxy can send any response. 20 seconds leaves a buffer for writing.
-const REQUEST_TIMEOUT_MS = 20000;
+// Render only kills a connection if NO data is sent within its idle window.
+// For streaming responses, once the first token arrives the connection stays open.
+// 55 seconds gives the model enough queue time on busy days without risking
+// the stacking problem that caused 502s (which was from 180s hung requests).
+const REQUEST_TIMEOUT_MS = 55000;
 
 // Per-model token limits.
 const MODEL_MAX_TOKENS = {
