@@ -303,10 +303,11 @@ app.post('/v1/chat/completions', async (req, res) => {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     nimBody.model = activeModel;
 
-  // V4 models require this parameter or they hang indefinitely.
-  // enable_thinking: false = Non-think (fast) mode, responses start immediately.
+  // V4 models require enable_thinking: true to stream any tokens at all.
+  // Counterintuitively, false causes an indefinite hang with no response.
+  // The reasoning output goes into reasoning_content and is stripped before delivery.
   if (REQUIRES_THINKING_PARAM.has(activeModel)) {
-    nimBody.chat_template_kwargs = { enable_thinking: false, thinking: false };
+    nimBody.chat_template_kwargs = { enable_thinking: true, thinking: true };
   } else {
     delete nimBody.chat_template_kwargs;
   }
