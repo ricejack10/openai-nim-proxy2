@@ -29,7 +29,7 @@ const RETRY_DELAY_MS = 500;
 // For streaming responses, once the first token arrives the connection stays open.
 // 55 seconds gives the model enough queue time on busy days without risking
 // the stacking problem that caused 502s (which was from 180s hung requests).
-const REQUEST_TIMEOUT_MS = 55000;
+const REQUEST_TIMEOUT_MS = 120000;
 
 // Per-model token limits.
 const MODEL_MAX_TOKENS = {
