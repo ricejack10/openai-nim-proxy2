@@ -303,13 +303,10 @@ app.post('/v1/chat/completions', async (req, res) => {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     nimBody.model = activeModel;
 
-  // V4 models require chat_template_kwargs to respond correctly.
-  // Official NVIDIA docs show the correct key is "thinking", not "enable_thinking".
-  // thinking: false = skip reasoning phase, respond immediately (fastest).
-  // thinking: true + reasoning_effort: "low"/"medium"/"high" = reasoning modes.
-  // Reasoning output goes into reasoning_content and is already stripped before delivery.
+  // Confirmed required by multiple sources — NIM hangs without both of these.
+  // Reasoning output arrives in reasoning_content and is stripped before delivery.
   if (REQUIRES_THINKING_PARAM.has(activeModel)) {
-    nimBody.chat_template_kwargs = { thinking: false };
+    nimBody.chat_template_kwargs = { enable_thinking: true, thinking: true };
   } else {
     delete nimBody.chat_template_kwargs;
   }
