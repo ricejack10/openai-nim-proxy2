@@ -28,7 +28,7 @@ const RETRY_DELAY_MS = 1000;
 // Spacing requests 13 seconds apart keeps us safely under that limit
 // so 429s never occur in the first place rather than recovering after.
 // Increase this number if you still see 429 errors.
-const MIN_REQUEST_INTERVAL_MS = 13000;
+const MIN_REQUEST_INTERVAL_MS = 15000;
 
 // Tracks when the last NIM request was dispatched.
 let lastRequestTime = 0;
@@ -82,9 +82,10 @@ const REQUIRES_THINKING_PARAM = new Set([
 // No current models emit inline <think> tags.
 const NATIVE_THINKERS = new Set([]);
 
-// Generation parameters forwarded verbatim to NIM when present on the request.
+// Generation parameters forwarded verbatim to NIM at the root level.
+// top_k is excluded here — NIM requires it inside an nvext object (handled below).
 const FORWARDED_PARAMS = [
-  'temperature', 'top_p', 'top_k', 'min_p',
+  'temperature', 'top_p', 'min_p',
   'max_tokens', 'stop',
   'frequency_penalty', 'presence_penalty',
   'seed', 'n', 'stream_options',
@@ -307,6 +308,11 @@ app.post('/v1/chat/completions', async (req, res) => {
     nimBody.max_tokens = MODEL_MAX_TOKENS[nimModel] ?? 4096;
   }
   if (nimBody.temperature  === undefined) nimBody.temperature  = 0.6;
+
+  // NIM requires top_k inside an nvext object, not at the root level.
+  if (req.body.top_k !== undefined) {
+    nimBody.nvext = { top_k: req.body.top_k };
+  }
 
   // V4 models hang permanently without this parameter — inject it unconditionally.
   // Reasoning output arrives in reasoning_content and is stripped before delivery.
