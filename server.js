@@ -19,15 +19,30 @@ app.use(express.json({ limit: '10mb' }));
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY  = process.env.NIM_API_KEY;
 
-// How many times to retry on transient errors.
-const MAX_RETRIES = 3;
-
-// Base delay for 503/504 congestion retries.
+// How many times to retry on 503/504 congestion errors.
+// 429 is handled by the request spacer below and never retried.
+const MAX_RETRIES    = 2;
 const RETRY_DELAY_MS = 1000;
 
-// Minimum wait on 429 rate limit if no Retry-After header is present.
-// NIM's free tier resets per-minute, so 60s is the safe floor.
-const RATE_LIMIT_DELAY_MS = 60000;
+// NIM free tier allows approximately 5 requests per minute.
+// Spacing requests 13 seconds apart keeps us safely under that limit
+// so 429s never occur in the first place rather than recovering after.
+// Increase this number if you still see 429 errors.
+const MIN_REQUEST_INTERVAL_MS = 13000;
+
+// Tracks when the last NIM request was dispatched.
+let lastRequestTime = 0;
+
+// Waits however long is needed so that requests are spaced by MIN_REQUEST_INTERVAL_MS.
+async function waitForRateLimit(id) {
+  const elapsed = Date.now() - lastRequestTime;
+  const wait    = MIN_REQUEST_INTERVAL_MS - elapsed;
+  if (wait > 0) {
+    console.log(`[${now()}] [${id}] Rate limiter: waiting ${Math.round(wait / 1000)}s before calling NIM`);
+    await sleep(wait);
+  }
+  lastRequestTime = Date.now();
+}
 
 // Render only kills a connection if NO data is sent within its idle window.
 // For streaming responses, once the first token arrives the connection stays open.
@@ -75,8 +90,8 @@ const FORWARDED_PARAMS = [
   'seed', 'n', 'stream_options',
 ];
 
-// HTTP status codes that indicate transient server congestion and are safe to retry.
-const RETRYABLE_STATUSES = new Set([429, 503, 504]);
+// HTTP status codes safe to retry — 429 is prevented by the spacer above, not retried.
+const RETRYABLE_STATUSES = new Set([503, 504]);
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -307,15 +322,14 @@ app.post('/v1/chat/completions', async (req, res) => {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     nimBody.model = activeModel;
 
-  // Confirmed required by multiple sources — NIM hangs without both of these.
-  // Reasoning output arrives in reasoning_content and is stripped before delivery.
-  if (REQUIRES_THINKING_PARAM.has(activeModel)) {
-    nimBody.chat_template_kwargs = { enable_thinking: true, thinking: true };
-  } else {
-    delete nimBody.chat_template_kwargs;
-  }
+    if (REQUIRES_THINKING_PARAM.has(activeModel)) {
+      nimBody.chat_template_kwargs = { enable_thinking: true, thinking: true };
+    } else {
+      delete nimBody.chat_template_kwargs;
+    }
 
     try {
+      await waitForRateLimit(id);
       response = await callNIM(nimBody, isStream, id);
       lastErr  = null;
       break;
@@ -337,16 +351,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       if (isTimeout) break;
 
       if (attempt < MAX_RETRIES && RETRYABLE_STATUSES.has(status)) {
-        let wait;
-        if (status === 429) {
-          // Respect Retry-After header if NIM sends one, otherwise wait the full minute
-          const retryAfter = err.response?.headers?.['retry-after'];
-          wait = retryAfter ? (parseFloat(retryAfter) * 1000) : RATE_LIMIT_DELAY_MS;
-          console.warn(`[${now()}] [${id}] NIM returned 429 (rate limited), waiting ${Math.round(wait / 1000)}s before retry (attempt ${attempt + 1}/${MAX_RETRIES})`);
-        } else {
-          wait = RETRY_DELAY_MS * (attempt + 1);
-          console.warn(`[${now()}] [${id}] NIM returned ${status}, retrying in ${wait}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
-        }
+        const wait = RETRY_DELAY_MS * (attempt + 1);
+        console.warn(`[${now()}] [${id}] NIM returned ${status}, retrying in ${wait}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
         await sleep(wait);
         continue;
       }
