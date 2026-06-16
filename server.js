@@ -24,16 +24,14 @@ const NIM_API_KEY  = process.env.NIM_API_KEY;
 const MAX_RETRIES    = 2;
 const RETRY_DELAY_MS = 1000;
 
-// NIM free tier allows approximately 5 requests per minute.
-// Spacing requests 13 seconds apart keeps us safely under that limit
-// so 429s never occur in the first place rather than recovering after.
-// Increase this number if you still see 429 errors.
-const MIN_REQUEST_INTERVAL_MS = 15000;
+// 5 RPM documented limit means one request every 12s in theory.
+// In practice the free tier appears stricter — 20s spacing avoids 429s.
+const MIN_REQUEST_INTERVAL_MS = 20000;
 
 // Tracks when the last NIM request was dispatched.
 let lastRequestTime = 0;
 
-// Waits however long is needed so that requests are spaced by MIN_REQUEST_INTERVAL_MS.
+// Waits however long is needed so requests are spaced by MIN_REQUEST_INTERVAL_MS.
 async function waitForRateLimit(id) {
   const elapsed = Date.now() - lastRequestTime;
   const wait    = MIN_REQUEST_INTERVAL_MS - elapsed;
@@ -82,13 +80,14 @@ const REQUIRES_THINKING_PARAM = new Set([
 // No current models emit inline <think> tags.
 const NATIVE_THINKERS = new Set([]);
 
-// Generation parameters forwarded verbatim to NIM at the root level.
-// top_k is excluded here — NIM requires it inside an nvext object (handled below).
+// Parameters forwarded to NIM at the root level.
+// min_p, stream_options, and n are excluded — NIM rejects them with 400.
+// top_k is excluded — NIM requires it inside nvext (handled below).
 const FORWARDED_PARAMS = [
-  'temperature', 'top_p', 'min_p',
+  'temperature', 'top_p',
   'max_tokens', 'stop',
   'frequency_penalty', 'presence_penalty',
-  'seed', 'n', 'stream_options',
+  'seed',
 ];
 
 // HTTP status codes safe to retry — 429 is prevented by the spacer above, not retried.
@@ -307,12 +306,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   if (nimBody.max_tokens  === undefined) {
     nimBody.max_tokens = MODEL_MAX_TOKENS[nimModel] ?? 4096;
   }
-  if (nimBody.temperature  === undefined) nimBody.temperature  = 0.6;
-
-  // NIM requires top_k inside an nvext object, not at the root level.
-  if (req.body.top_k !== undefined) {
-    nimBody.nvext = { top_k: req.body.top_k };
-  }
+  if (nimBody.temperature === undefined) nimBody.temperature = 0.6;
 
   // V4 models hang permanently without this parameter — inject it unconditionally.
   // Reasoning output arrives in reasoning_content and is stripped before delivery.
