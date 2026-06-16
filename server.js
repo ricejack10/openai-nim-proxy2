@@ -1,4 +1,4 @@
-// server.js - OpenAI to NVIDIA NIM API Proxy
+// server.js - OpenAI Compatible Proxy — OpenRouter backend
 'use strict';
 
 const express = require('express');
@@ -16,82 +16,67 @@ app.use(express.json({ limit: '10mb' }));
 // Configuration
 // ---------------------------------------------------------------------------
 
-const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
-const NIM_API_KEY  = process.env.NIM_API_KEY;
+// Set OPENROUTER_API_KEY in Render's environment variables.
+// Get a free key at openrouter.ai — no credit card required.
+const API_BASE = process.env.NIM_API_BASE || 'https://openrouter.ai/api/v1';
+const API_KEY  = process.env.NIM_API_KEY;
 
-// How many times to retry on 503/504 congestion errors.
-// 429 is handled by the request spacer below and never retried.
 const MAX_RETRIES    = 2;
 const RETRY_DELAY_MS = 1000;
 
-// 5 RPM documented limit means one request every 12s in theory.
-// In practice the free tier appears stricter — 20s spacing avoids 429s.
-const MIN_REQUEST_INTERVAL_MS = 20000;
+// OpenRouter free tier allows 20 RPM — 3 second spacing is enough.
+// Much more generous than NIM's 5 RPM.
+const MIN_REQUEST_INTERVAL_MS = 3000;
 
-// Tracks when the last NIM request was dispatched.
+// Tracks when the last request was dispatched.
 let lastRequestTime = 0;
 
-// Waits however long is needed so requests are spaced by MIN_REQUEST_INTERVAL_MS.
 async function waitForRateLimit(id) {
   const elapsed = Date.now() - lastRequestTime;
   const wait    = MIN_REQUEST_INTERVAL_MS - elapsed;
   if (wait > 0) {
-    console.log(`[${now()}] [${id}] Rate limiter: waiting ${Math.round(wait / 1000)}s before calling NIM`);
+    console.log(`[${now()}] [${id}] Rate limiter: waiting ${Math.round(wait / 1000)}s`);
     await sleep(wait);
   }
   lastRequestTime = Date.now();
 }
 
-// Render only kills a connection if NO data is sent within its idle window.
-// For streaming responses, once the first token arrives the connection stays open.
-// 55 seconds gives the model enough queue time on busy days without risking
-// the stacking problem that caused 502s (which was from 180s hung requests).
 const REQUEST_TIMEOUT_MS = 120000;
 
-// Per-model token limits.
-const MODEL_MAX_TOKENS = {
-  'deepseek-ai/deepseek-v4-pro':   800,
-  'deepseek-ai/deepseek-v4-flash': 800,
-};
-
-// If V4-pro times out, try V4-flash before giving up.
-// V3.x models all retired as of May 4 2026 — no older fallback available.
-const FALLBACK_MODEL = {
-  'deepseek-ai/deepseek-v4-pro': 'deepseek-ai/deepseek-v4-flash',
-};
-
-// OpenAI alias -> NVIDIA NIM model ID.
-// Last verified: May 9 2026.
-// v3.1-terminus retired April 15 2026, v3.2 retired May 4 2026 — both 410 Gone.
-// V4 models are the only live DeepSeek models on the hosted NIM API.
+// OpenRouter model IDs — :free suffix routes to the free tier.
+// These are the actual DeepSeek models running on OpenRouter's infrastructure.
 const MODEL_MAPPING = {
-  'deepseek-v4':       'deepseek-ai/deepseek-v4-pro',    // 1.6T params, 49B active
-  'deepseek-v4-flash': 'deepseek-ai/deepseek-v4-flash',  // 284B params, 13B active — faster
+  'deepseek-v3':  'deepseek/deepseek-chat-v3-0324:free', // DeepSeek V3 — best for roleplay
+  'deepseek-r1':  'deepseek/deepseek-r1:free',           // DeepSeek R1 — reasoning model
 };
 
-// V4 models require chat_template_kwargs to respond at all.
-// enable_thinking: false = Non-think (fast) mode — responses start immediately.
-// enable_thinking: true  = Think High/Max — model reasons before responding, causes timeouts.
-const REQUIRES_THINKING_PARAM = new Set([
-  'deepseek-ai/deepseek-v4-pro',
-  'deepseek-ai/deepseek-v4-flash',
+// Per-model token defaults.
+const MODEL_MAX_TOKENS = {
+  'deepseek/deepseek-chat-v3-0324:free': 800,
+  'deepseek/deepseek-r1:free':           800,
+};
+
+// R1 outputs inline <think> blocks — strip them before delivery.
+const NATIVE_THINKERS = new Set([
+  'deepseek/deepseek-r1:free',
 ]);
 
-// No current models emit inline <think> tags.
-const NATIVE_THINKERS = new Set([]);
+// Fallback: if R1 fails, try V3.
+const FALLBACK_MODEL = {
+  'deepseek/deepseek-r1:free': 'deepseek/deepseek-chat-v3-0324:free',
+};
 
-// Parameters forwarded to NIM at the root level.
-// min_p, stream_options, and n are excluded — NIM rejects them with 400.
-// top_k is excluded — NIM requires it inside nvext (handled below).
+// OpenRouter accepts the full standard parameter set.
 const FORWARDED_PARAMS = [
-  'temperature', 'top_p',
+  'temperature', 'top_p', 'top_k', 'min_p',
   'max_tokens', 'stop',
   'frequency_penalty', 'presence_penalty',
-  'seed',
+  'seed', 'n',
 ];
 
-// HTTP status codes safe to retry — 429 is prevented by the spacer above, not retried.
-const RETRYABLE_STATUSES = new Set([503, 504]);
+// 429 is now retried — OpenRouter's 429 is a brief per-minute limit,
+// not an account-level daily cap like NIM's was.
+const RETRYABLE_STATUSES = new Set([429, 503, 504]);
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -229,13 +214,15 @@ app.get('/v1/models', (req, res) => {
 
 async function callNIM(nimBody, isStream, id) {
   return axios.post(
-    `${NIM_API_BASE}/chat/completions`,
+    `${API_BASE}/chat/completions`,
     nimBody,
     {
       headers: {
-        'Authorization': `Bearer ${NIM_API_KEY}`,
-        'Content-Type':  'application/json',
-        'Accept':        isStream ? 'text/event-stream' : 'application/json',
+        'Authorization':  `Bearer ${API_KEY}`,
+        'Content-Type':   'application/json',
+        'Accept':         isStream ? 'text/event-stream' : 'application/json',
+        'HTTP-Referer':   'https://openrouter.ai',
+        'X-Title':        'JanitorAI Proxy',
       },
       responseType: isStream ? 'stream' : 'json',
       timeout:      REQUEST_TIMEOUT_MS,
@@ -251,7 +238,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   const id = reqId();
 
   // --- API key guard --------------------------------------------------------
-  if (!NIM_API_KEY) {
+  if (!API_KEY) {
     console.error(`[${now()}] [${id}] FATAL: NIM_API_KEY is not set`);
     return res.status(500).json({
       error: { message: 'NIM_API_KEY environment variable is not set', type: 'server_error', code: 500 },
@@ -296,7 +283,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     console.log(`  [${i}] ${msg.role.toUpperCase()}: ${contentPreview(msg.content)}`);
   });
 
-  // --- Build NIM request body -----------------------------------------------
+  // --- Build request body ---------------------------------------------------
   const nimBody = { model: nimModel, messages, stream: isStream };
 
   for (const param of FORWARDED_PARAMS) {
@@ -308,25 +295,13 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
   if (nimBody.temperature === undefined) nimBody.temperature = 0.6;
 
-  // V4 models hang permanently without this parameter — inject it unconditionally.
-  // Reasoning output arrives in reasoning_content and is stripped before delivery.
-  if (REQUIRES_THINKING_PARAM.has(nimModel)) {
-    nimBody.chat_template_kwargs = { enable_thinking: true, thinking: true };
-  }
-
-  // --- Call NIM with retry on transient errors ------------------------------
+  // --- Call API with retry --------------------------------------------------
   let response;
   let lastErr;
   let activeModel = nimModel;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     nimBody.model = activeModel;
-
-    if (REQUIRES_THINKING_PARAM.has(activeModel)) {
-      nimBody.chat_template_kwargs = { enable_thinking: true, thinking: true };
-    } else {
-      delete nimBody.chat_template_kwargs;
-    }
 
     try {
       await waitForRateLimit(id);
@@ -335,10 +310,9 @@ app.post('/v1/chat/completions', async (req, res) => {
       break;
     } catch (err) {
       lastErr = err;
-      const status  = err.response?.status;
+      const status    = err.response?.status;
       const isTimeout = err.code === 'ECONNABORTED';
 
-      // On timeout, try falling back to the stable model before giving up
       if (isTimeout && FALLBACK_MODEL[activeModel]) {
         const fallback = FALLBACK_MODEL[activeModel];
         console.warn(`[${now()}] [${id}] ${activeModel} timed out — falling back to ${fallback}`);
@@ -347,12 +321,11 @@ app.post('/v1/chat/completions', async (req, res) => {
         continue;
       }
 
-      // Do not retry timeouts — stacking hung connections exhausts Render memory
       if (isTimeout) break;
 
       if (attempt < MAX_RETRIES && RETRYABLE_STATUSES.has(status)) {
         const wait = RETRY_DELAY_MS * (attempt + 1);
-        console.warn(`[${now()}] [${id}] NIM returned ${status}, retrying in ${wait}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        console.warn(`[${now()}] [${id}] OpenRouter returned ${status}, retrying in ${wait}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
         await sleep(wait);
         continue;
       }
