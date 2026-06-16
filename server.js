@@ -19,11 +19,15 @@ app.use(express.json({ limit: '10mb' }));
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY  = process.env.NIM_API_KEY;
 
-// How many times to retry a request when NIM returns 429, 503, or 504.
-// Timeouts (ECONNABORTED) are NOT retried — retrying a hung connection
-// stacks more hung connections and can exhaust Render's memory.
-const MAX_RETRIES    = 2;
-const RETRY_DELAY_MS = 500;
+// How many times to retry on transient errors.
+const MAX_RETRIES = 3;
+
+// Base delay for 503/504 congestion retries.
+const RETRY_DELAY_MS = 1000;
+
+// Minimum wait on 429 rate limit if no Retry-After header is present.
+// NIM's free tier resets per-minute, so 60s is the safe floor.
+const RATE_LIMIT_DELAY_MS = 60000;
 
 // Render only kills a connection if NO data is sent within its idle window.
 // For streaming responses, once the first token arrives the connection stays open.
@@ -333,8 +337,16 @@ app.post('/v1/chat/completions', async (req, res) => {
       if (isTimeout) break;
 
       if (attempt < MAX_RETRIES && RETRYABLE_STATUSES.has(status)) {
-        const wait = RETRY_DELAY_MS * (attempt + 1);
-        console.warn(`[${now()}] [${id}] NIM returned ${status}, retrying in ${wait}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        let wait;
+        if (status === 429) {
+          // Respect Retry-After header if NIM sends one, otherwise wait the full minute
+          const retryAfter = err.response?.headers?.['retry-after'];
+          wait = retryAfter ? (parseFloat(retryAfter) * 1000) : RATE_LIMIT_DELAY_MS;
+          console.warn(`[${now()}] [${id}] NIM returned 429 (rate limited), waiting ${Math.round(wait / 1000)}s before retry (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        } else {
+          wait = RETRY_DELAY_MS * (attempt + 1);
+          console.warn(`[${now()}] [${id}] NIM returned ${status}, retrying in ${wait}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        }
         await sleep(wait);
         continue;
       }
