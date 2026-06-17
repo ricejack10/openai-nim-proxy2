@@ -1,4 +1,4 @@
-// server.js - OpenAI Compatible Proxy — OpenRouter backend
+// server.js - OpenAI to NVIDIA NIM API Proxy
 'use strict';
 
 const express = require('express');
@@ -16,26 +16,21 @@ app.use(express.json({ limit: '10mb' }));
 // Configuration
 // ---------------------------------------------------------------------------
 
-// Set OPENROUTER_API_KEY in Render's environment variables.
-// Get a free key at openrouter.ai — no credit card required.
-const API_BASE = process.env.NIM_API_BASE || 'https://openrouter.ai/api/v1';
-const API_KEY  = process.env.NIM_API_KEY;
+const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
+const NIM_API_KEY  = process.env.NIM_API_KEY;
 
 const MAX_RETRIES    = 2;
 const RETRY_DELAY_MS = 1000;
 
-// OpenRouter free tier allows 20 RPM — 3 second spacing is enough.
-// Much more generous than NIM's 5 RPM.
-const MIN_REQUEST_INTERVAL_MS = 3000;
+const MIN_REQUEST_INTERVAL_MS = 20000;
 
-// Tracks when the last request was dispatched.
 let lastRequestTime = 0;
 
 async function waitForRateLimit(id) {
   const elapsed = Date.now() - lastRequestTime;
   const wait    = MIN_REQUEST_INTERVAL_MS - elapsed;
   if (wait > 0) {
-    console.log(`[${now()}] [${id}] Rate limiter: waiting ${Math.round(wait / 1000)}s`);
+    console.log(`[${now()}] [${id}] Rate limiter: waiting ${Math.round(wait / 1000)}s before calling NIM`);
     await sleep(wait);
   }
   lastRequestTime = Date.now();
@@ -43,40 +38,42 @@ async function waitForRateLimit(id) {
 
 const REQUEST_TIMEOUT_MS = 120000;
 
-// OpenRouter model IDs — :free suffix routes to the free tier.
-// These are the actual DeepSeek models running on OpenRouter's infrastructure.
-const MODEL_MAPPING = {
-  'deepseek-v3':  'deepseek/deepseek-chat-v3-0324:free', // DeepSeek V3 — best for roleplay
-  'deepseek-r1':  'deepseek/deepseek-r1:free',           // DeepSeek R1 — reasoning model
-};
-
-// Per-model token defaults.
 const MODEL_MAX_TOKENS = {
-  'deepseek/deepseek-chat-v3-0324:free': 800,
-  'deepseek/deepseek-r1:free':           800,
+  'deepseek-ai/deepseek-v4-pro':   800,
+  'deepseek-ai/deepseek-v4-flash': 800,
 };
 
-// R1 outputs inline <think> blocks — strip them before delivery.
-const NATIVE_THINKERS = new Set([
-  'deepseek/deepseek-r1:free',
+const FALLBACK_MODEL = {
+  'deepseek-ai/deepseek-v4-pro': 'deepseek-ai/deepseek-v4-flash',
+};
+
+// Last verified: May 2026.
+// v3.x all retired. V4 models are the only live DeepSeek models on hosted NIM.
+const MODEL_MAPPING = {
+  'deepseek-v4':       'deepseek-ai/deepseek-v4-pro',
+  'deepseek-v4-flash': 'deepseek-ai/deepseek-v4-flash',
+};
+
+// V4 models require both these fields or they hang indefinitely.
+const REQUIRES_THINKING_PARAM = new Set([
+  'deepseek-ai/deepseek-v4-pro',
+  'deepseek-ai/deepseek-v4-flash',
 ]);
 
-// Fallback: if R1 fails, try V3.
-const FALLBACK_MODEL = {
-  'deepseek/deepseek-r1:free': 'deepseek/deepseek-chat-v3-0324:free',
-};
+// No current models emit inline <think> tags.
+const NATIVE_THINKERS = new Set([]);
 
-// OpenRouter accepts the full standard parameter set.
+// Parameters forwarded to NIM at the root level.
+// min_p, stream_options, n, top_k excluded — NIM rejects them with 400.
 const FORWARDED_PARAMS = [
-  'temperature', 'top_p', 'top_k', 'min_p',
+  'temperature', 'top_p',
   'max_tokens', 'stop',
   'frequency_penalty', 'presence_penalty',
-  'seed', 'n',
+  'seed',
 ];
 
-// 429 is now retried — OpenRouter's 429 is a brief per-minute limit,
-// not an account-level daily cap like NIM's was.
-const RETRYABLE_STATUSES = new Set([429, 503, 504]);
+// 429 excluded — prevented by rate limiter above, not retried.
+const RETRYABLE_STATUSES = new Set([503, 504]);
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -214,15 +211,13 @@ app.get('/v1/models', (req, res) => {
 
 async function callNIM(nimBody, isStream, id) {
   return axios.post(
-    `${API_BASE}/chat/completions`,
+    `${NIM_API_BASE}/chat/completions`,
     nimBody,
     {
       headers: {
-        'Authorization':  `Bearer ${API_KEY}`,
-        'Content-Type':   'application/json',
-        'Accept':         isStream ? 'text/event-stream' : 'application/json',
-        'HTTP-Referer':   'https://openrouter.ai',
-        'X-Title':        'JanitorAI Proxy',
+        'Authorization': `Bearer ${NIM_API_KEY}`,
+        'Content-Type':  'application/json',
+        'Accept':        isStream ? 'text/event-stream' : 'application/json',
       },
       responseType: isStream ? 'stream' : 'json',
       timeout:      REQUEST_TIMEOUT_MS,
@@ -238,7 +233,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   const id = reqId();
 
   // --- API key guard --------------------------------------------------------
-  if (!API_KEY) {
+  if (!NIM_API_KEY) {
     console.error(`[${now()}] [${id}] FATAL: NIM_API_KEY is not set`);
     return res.status(500).json({
       error: { message: 'NIM_API_KEY environment variable is not set', type: 'server_error', code: 500 },
@@ -295,13 +290,19 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
   if (nimBody.temperature === undefined) nimBody.temperature = 0.6;
 
-  // --- Call API with retry --------------------------------------------------
+  // --- Call NIM with retry --------------------------------------------------
   let response;
   let lastErr;
   let activeModel = nimModel;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     nimBody.model = activeModel;
+
+    if (REQUIRES_THINKING_PARAM.has(activeModel)) {
+      nimBody.chat_template_kwargs = { enable_thinking: true, thinking: true };
+    } else {
+      delete nimBody.chat_template_kwargs;
+    }
 
     try {
       await waitForRateLimit(id);
