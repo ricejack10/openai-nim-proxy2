@@ -22,7 +22,7 @@ const NIM_API_KEY  = process.env.NIM_API_KEY;
 const MAX_RETRIES    = 2;
 const RETRY_DELAY_MS = 1000;
 
-const MIN_REQUEST_INTERVAL_MS = 20000;
+const MIN_REQUEST_INTERVAL_MS = 5000;
 
 let lastRequestTime = 0;
 
