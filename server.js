@@ -486,63 +486,73 @@ app.all('*', (req, res) => {
 
 function handleAxiosError(err, id, res) {
   const status = err.response?.status;
-  let detail   = err.message;
 
-  // Distinguish timeout and connection reset from API errors for clearer logs
+  return resolveErrorDetail(err, status).then(detail => {
+    console.error(`[${now()}] [${id}] PROXY ERROR [${status || 500}]: ${preview(detail, 500)}`);
+
+    if (!res.headersSent) {
+      const httpStatus = status || 500;
+      res.status(httpStatus).json({
+        error: {
+          message: detail || 'An error occurred communicating with the NIM API',
+          type:    httpStatus >= 500 ? 'server_error' : 'invalid_request_error',
+          code:    httpStatus,
+        },
+      });
+    }
+  });
+}
+
+// Resolves the readable error body properly instead of racing a synchronous .read().
+async function resolveErrorDetail(err, status) {
   if (err.code === 'ECONNABORTED') {
-    detail = `Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s with no response from NIM`;
-  } else if (err.code === 'ECONNRESET') {
-    detail = 'NIM closed the connection unexpectedly (likely server-side congestion)';
-  } else if (err.response?.data) {
-    const raw = err.response.data;
-    if (typeof raw === 'string') {
-      detail = raw;
-    } else if (Buffer.isBuffer(raw)) {
-      detail = raw.toString('utf8');
-    } else if (raw && typeof raw.read === 'function') {
-      // Readable stream — happens when responseType is 'stream' and NIM returns a 4xx/5xx.
-      // The error body is already buffered internally; read it out synchronously.
-      try {
-        const chunks = [];
-        let chunk;
-        while (null !== (chunk = raw.read())) {
-          chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
-        }
-        detail = chunks.length > 0
-          ? Buffer.concat(chunks).toString('utf8')
-          : `[Empty stream body — HTTP ${status}]`;
-      } catch (_) {
-        detail = `[Could not read stream error body — HTTP ${status}]`;
-      }
-    } else if (typeof raw === 'object') {
-      // Plain object — safe to stringify with circular reference guard
-      try {
-        const seen = new WeakSet();
-        detail = JSON.stringify(raw, (key, value) => {
-          if (typeof value === 'object' && value !== null) {
-            if (seen.has(value)) return '[Circular]';
-            seen.add(value);
-          }
-          return value;
-        });
-      } catch (_) {
-        detail = `[Unserializable error object: ${raw?.constructor?.name || 'unknown'}]`;
-      }
+    return `Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s with no response from NIM`;
+  }
+  if (err.code === 'ECONNRESET') {
+    return 'NIM closed the connection unexpectedly (likely server-side congestion)';
+  }
+
+  const raw = err.response?.data;
+  if (!raw) return err.message;
+
+  if (typeof raw === 'string') return raw;
+  if (Buffer.isBuffer(raw)) return raw.toString('utf8');
+
+  // Readable stream — wait for it to actually finish emitting data before reading.
+  if (raw && typeof raw.on === 'function') {
+    try {
+      const chunks = await new Promise((resolve, reject) => {
+        const collected = [];
+        raw.on('data', (chunk) => collected.push(chunk));
+        raw.on('end', () => resolve(collected));
+        raw.on('error', reject);
+        // Safety timeout in case the stream never emits 'end'
+        setTimeout(() => resolve(collected), 3000);
+      });
+      return chunks.length > 0
+        ? Buffer.concat(chunks).toString('utf8')
+        : `[Empty stream body — HTTP ${status}]`;
+    } catch (_) {
+      return `[Could not read stream error body — HTTP ${status}]`;
     }
   }
 
-  const httpStatus = status || 500;
-  console.error(`[${now()}] [${id}] PROXY ERROR [${httpStatus}]: ${preview(detail, 500)}`);
-
-  if (!res.headersSent) {
-    res.status(httpStatus).json({
-      error: {
-        message: detail || 'An error occurred communicating with the NIM API',
-        type:    httpStatus >= 500 ? 'server_error' : 'invalid_request_error',
-        code:    httpStatus,
-      },
-    });
+  if (typeof raw === 'object') {
+    try {
+      const seen = new WeakSet();
+      return JSON.stringify(raw, (key, value) => {
+        if (typeof value === 'object' && value !== null) {
+          if (seen.has(value)) return '[Circular]';
+          seen.add(value);
+        }
+        return value;
+      });
+    } catch (_) {
+      return `[Unserializable error object: ${raw?.constructor?.name || 'unknown'}]`;
+    }
   }
+
+  return String(raw);
 }
 
 // ---------------------------------------------------------------------------
