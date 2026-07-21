@@ -39,8 +39,12 @@ async function waitForRateLimit(id) {
 const REQUEST_TIMEOUT_MS = 120000;
 
 const MODEL_MAX_TOKENS = {
-  'deepseek-ai/deepseek-v4-pro':   800,
-  'deepseek-ai/deepseek-v4-flash': 800,
+  'deepseek-ai/deepseek-v4-pro':            800,
+  'deepseek-ai/deepseek-v4-flash':          800,
+  // Large NIM models hit a 600s decode wall clock timeout with high token counts
+  'nvidia/nemotron-3-ultra-550b-a55b':      400,
+  'nvidia/llama-3.1-nemotron-ultra-253b-v1': 400,
+  'meta/llama-3.1-405b-instruct':           400,
 };
 
 const FALLBACK_MODEL = {
@@ -61,7 +65,12 @@ const REQUIRES_THINKING_PARAM = new Set([
 ]);
 
 // No current models emit inline <think> tags.
-const NATIVE_THINKERS = new Set([]);
+// V4 models also added here because with thinking: true their reasoning
+// chain leaks into the content stream as mixed Chinese/English gibberish.
+const NATIVE_THINKERS = new Set([
+  'deepseek-ai/deepseek-v4-pro',
+  'deepseek-ai/deepseek-v4-flash',
+]);
 
 // Parameters forwarded to NIM at the root level.
 // min_p, stream_options, n, top_k excluded — NIM rejects them with 400.
@@ -298,8 +307,11 @@ app.post('/v1/chat/completions', async (req, res) => {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     nimBody.model = activeModel;
 
+    // Disable thinking to prevent V4's reasoning chain from leaking into content.
+    // When thinking is enabled, V4 outputs Chinese reasoning tokens mixed into the
+    // content stream which produces garbled output on the client side.
     if (REQUIRES_THINKING_PARAM.has(activeModel)) {
-      nimBody.chat_template_kwargs = { enable_thinking: true, thinking: true };
+      nimBody.chat_template_kwargs = { enable_thinking: false, thinking: false };
     } else {
       delete nimBody.chat_template_kwargs;
     }
@@ -352,7 +364,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     let lineBuffer     = '';
     let logAccumulator = '';
-    const thinkState   = isNativeThinker ? makeThinkState() : null;
+    const thinkState   = makeThinkState();
 
     response.data.on('data', (chunk) => {
       lineBuffer += chunk.toString();
@@ -391,21 +403,27 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         let content = typeof delta.content === 'string' ? delta.content : '';
 
-        if (isNativeThinker) {
-          content = processThinkChunk(content, thinkState);
-        }
+        // Strip think blocks from all models unconditionally.
+        // For models that produce no think tags this is a no-op.
+        // For any model whose reasoning leaks into the content stream
+        // (V4, Nemotron, and others) this catches and removes it.
+        content = processThinkChunk(content, thinkState);
 
-        if (content || !isNativeThinker) {
+        if (content) {
           delta.content   = content;
           logAccumulator += content;
+          res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+        } else if (!delta.content && parsed.choices?.[0]?.finish_reason) {
+          // Always forward the final chunk that carries finish_reason
+          delta.content = '';
           res.write(`data: ${JSON.stringify(parsed)}\n\n`);
         }
       }
     });
 
     response.data.on('end', () => {
-      // Flush any think-state pending buffer (trailing partial tag in pass phase)
-      if (isNativeThinker && thinkState.pending && thinkState.phase === 'pass') {
+      // Flush any pending buffer content that was held back waiting for a tag boundary
+      if (thinkState.pending && thinkState.phase === 'pass') {
         const flush = thinkState.pending;
         if (flush) {
           const flushChunk = {
@@ -444,7 +462,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     const msg = choice.message ?? {};
     let content = msg.content ?? '';
 
-    if (isNativeThinker) content = stripThinkingFull(content);
+    // Strip think blocks from all models unconditionally
+    content = stripThinkingFull(content);
     delete msg.reasoning_content;
 
     return {
