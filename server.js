@@ -39,37 +39,27 @@ async function waitForRateLimit(id) {
 const REQUEST_TIMEOUT_MS = 120000;
 
 const MODEL_MAX_TOKENS = {
-  'deepseek-ai/deepseek-v4-pro':            800,
-  'deepseek-ai/deepseek-v4-flash':          800,
-  // Large NIM models hit a 600s decode wall clock timeout with high token counts
-  'nvidia/nemotron-3-ultra-550b-a55b':      400,
+  'deepseek-ai/deepseek-v4-pro':             800,
+  'nvidia/nemotron-3-ultra-550b-a55b':       400,
   'nvidia/llama-3.1-nemotron-ultra-253b-v1': 400,
-  'meta/llama-3.1-405b-instruct':           400,
+  'meta/llama-3.1-405b-instruct':            400,
 };
 
-const FALLBACK_MODEL = {
-  'deepseek-ai/deepseek-v4-pro': 'deepseek-ai/deepseek-v4-flash',
-};
+// v4-flash retired August 7 2026. No fallback available — v4-pro is the only live DeepSeek model.
+const FALLBACK_MODEL = {};
 
-// Last verified: May 2026.
-// v3.x all retired. V4 models are the only live DeepSeek models on hosted NIM.
+// Last verified: August 7 2026.
+// deepseek-v4-flash retired today (410 Gone).
 const MODEL_MAPPING = {
-  'deepseek-v4':       'deepseek-ai/deepseek-v4-pro',
-  'deepseek-v4-flash': 'deepseek-ai/deepseek-v4-flash',
+  'deepseek-v4': 'deepseek-ai/deepseek-v4-pro',
 };
 
-// V4 models require both these fields or they hang indefinitely.
 const REQUIRES_THINKING_PARAM = new Set([
   'deepseek-ai/deepseek-v4-pro',
-  'deepseek-ai/deepseek-v4-flash',
 ]);
 
-// No current models emit inline <think> tags.
-// V4 models also added here because with thinking: true their reasoning
-// chain leaks into the content stream as mixed Chinese/English gibberish.
 const NATIVE_THINKERS = new Set([
   'deepseek-ai/deepseek-v4-pro',
-  'deepseek-ai/deepseek-v4-flash',
 ]);
 
 // Parameters forwarded to NIM at the root level.
