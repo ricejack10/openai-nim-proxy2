@@ -39,28 +39,43 @@ async function waitForRateLimit(id) {
 const REQUEST_TIMEOUT_MS = 120000;
 
 const MODEL_MAX_TOKENS = {
-  'deepseek-ai/deepseek-v4-pro':             800,
-  'nvidia/nemotron-3-ultra-550b-a55b':       400,
-  'nvidia/llama-3.1-nemotron-ultra-253b-v1': 400,
-  'meta/llama-3.1-405b-instruct':            400,
+  // Large reasoning models — low cap to avoid 600s decode timeout
+  'moonshotai/kimi-k2-instruct':                  800,
+  'mistralai/mistral-large-3-675b-instruct-2512': 800,
+  'meta/llama-3.1-405b-instruct':                 400,
+  'qwen/qwen3-coder-480b-a35b-instruct':          400,
+  'z-ai/glm-5.2':                                 400, // 753B reasoning model, very slow
+  // Mid-size models
+  'nvidia/llama-3.3-nemotron-super-49b-v1':       800,
+  'bytedance/seed-oss-36b-instruct':              800,
+  'mistralai/magistral-small-2506':               800,
 };
 
-// v4-flash retired August 7 2026. No fallback available — v4-pro is the only live DeepSeek model.
-const FALLBACK_MODEL = {};
+const FALLBACK_MODEL = {
+  'moonshotai/kimi-k2-instruct':                  'nvidia/llama-3.3-nemotron-super-49b-v1',
+  'mistralai/mistral-large-3-675b-instruct-2512': 'nvidia/llama-3.3-nemotron-super-49b-v1',
+  'z-ai/glm-5.2':                                 'nvidia/llama-3.3-nemotron-super-49b-v1',
+};
 
 // Last verified: August 7 2026.
-// deepseek-v4-flash retired today (410 Gone).
+// All DeepSeek models retired from NIM hosted API.
 const MODEL_MAPPING = {
-  'deepseek-v4': 'deepseek-ai/deepseek-v4-pro',
+  'kimi-k2':       'moonshotai/kimi-k2-instruct',
+  'mistral-large': 'mistralai/mistral-large-3-675b-instruct-2512',
+  'llama-405b':    'meta/llama-3.1-405b-instruct',
+  'nemotron-49b':  'nvidia/llama-3.3-nemotron-super-49b-v1',
+  'seed-36b':      'bytedance/seed-oss-36b-instruct',
+  'magistral':     'mistralai/magistral-small-2506',
+  'qwen-coder':    'qwen/qwen3-coder-480b-a35b-instruct',
+  'glm-5':         'z-ai/glm-5.2', // 753B MoE reasoning model — slow on free tier
 };
 
-const REQUIRES_THINKING_PARAM = new Set([
-  'deepseek-ai/deepseek-v4-pro',
-]);
+// None of these models require special parameters.
+const REQUIRES_THINKING_PARAM = new Set([]);
 
-const NATIVE_THINKERS = new Set([
-  'deepseek-ai/deepseek-v4-pro',
-]);
+// magistral returns reasoning in reasoning_content — already stripped by existing code.
+// Think-stripping still runs on all content unconditionally as a safety net.
+const NATIVE_THINKERS = new Set([]);
 
 // Parameters forwarded to NIM at the root level.
 // min_p, stream_options, n, top_k excluded — NIM rejects them with 400.
@@ -296,15 +311,6 @@ app.post('/v1/chat/completions', async (req, res) => {
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     nimBody.model = activeModel;
-
-    // Disable thinking to prevent V4's reasoning chain from leaking into content.
-    // When thinking is enabled, V4 outputs Chinese reasoning tokens mixed into the
-    // content stream which produces garbled output on the client side.
-    if (REQUIRES_THINKING_PARAM.has(activeModel)) {
-      nimBody.chat_template_kwargs = { enable_thinking: false, thinking: false };
-    } else {
-      delete nimBody.chat_template_kwargs;
-    }
 
     try {
       await waitForRateLimit(id);
