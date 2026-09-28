@@ -22,20 +22,6 @@ const NIM_API_KEY  = process.env.NIM_API_KEY;
 const MAX_RETRIES    = 2;
 const RETRY_DELAY_MS = 1000;
 
-const MIN_REQUEST_INTERVAL_MS = 20000;
-
-let lastRequestTime = 0;
-
-async function waitForRateLimit(id) {
-  const elapsed = Date.now() - lastRequestTime;
-  const wait    = MIN_REQUEST_INTERVAL_MS - elapsed;
-  if (wait > 0) {
-    console.log(`[${now()}] [${id}] Rate limiter: waiting ${Math.round(wait / 1000)}s before calling NIM`);
-    await sleep(wait);
-  }
-  lastRequestTime = Date.now();
-}
-
 const REQUEST_TIMEOUT_MS = 120000;
 
 const MODEL_MAX_TOKENS = {
@@ -313,7 +299,6 @@ app.post('/v1/chat/completions', async (req, res) => {
     nimBody.model = activeModel;
 
     try {
-      await waitForRateLimit(id);
       response = await callNIM(nimBody, isStream, id);
       lastErr  = null;
       break;
