@@ -10,7 +10,7 @@
 // Important:
 // - No automatic retries.
 // - No fallback-model attempts.
-// - Each NVIDIA request has a 3-minute timeout.
+// - Each NVIDIA request has a 4-minute timeout.
 // - This proxy does NOT impose max_tokens/min_tokens.
 // - Client-supplied supported parameters are forwarded unchanged.
 // - Model IDs can be passed directly, or aliases below can be used.
@@ -32,8 +32,8 @@ const NIM_API_BASE = (
 
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// Fixed 3-minute timeout. No retries or fallback attempts.
-const REQUEST_TIMEOUT_MS = 180000;
+// Fixed 4-minute timeout. No retries or fallback attempts.
+const REQUEST_TIMEOUT_MS = 240000;
 
 // -----------------------------------------------------------------------------
 // Model aliases
