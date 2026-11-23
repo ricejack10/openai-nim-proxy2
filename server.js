@@ -25,6 +25,15 @@ const crypto = require('crypto');
 const app = express();
 
 const PORT = Number(process.env.PORT || 3000);
+
+// Keep-alive: Render sets RENDER_EXTERNAL_URL automatically. Pinging it every
+// 10 minutes counts as inbound traffic (Render idles after 15 minutes).
+// Set KEEP_ALIVE=off in Render env vars to disable.
+const KEEP_ALIVE_URL =
+  process.env.KEEP_ALIVE === 'off'
+    ? ''
+    : (process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
+const KEEP_ALIVE_INTERVAL_MS = 10 * 60 * 1000;
 const NIM_API_BASE = (
   process.env.NIM_API_BASE ||
   'https://integrate.api.nvidia.com/v1'
@@ -826,5 +835,16 @@ app.listen(PORT, () => {
   console.log('  Retries          : DISABLED');
   console.log('  Fallback models  : DISABLED');
   console.log('  Token limits     : NONE imposed by proxy');
+  console.log(`  Keep-alive       : ${KEEP_ALIVE_URL ? 'ON (' + KEEP_ALIVE_URL + ')' : 'OFF'}`);
   console.log('');
+
+  // Self-ping through the public URL so Render does not idle the service.
+  if (KEEP_ALIVE_URL) {
+    const timer = setInterval(() => {
+      axios
+        .get(`${KEEP_ALIVE_URL}/health`, { timeout: 15000 })
+        .catch(err => console.log(`[keep-alive] ping failed: ${err.message}`));
+    }, KEEP_ALIVE_INTERVAL_MS);
+    timer.unref();
+  }
 });
